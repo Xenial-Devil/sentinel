@@ -2,12 +2,10 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches: ["main"]
 
 env:
   IMAGE_NAME: sentinel
-  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
 
 jobs:
   release:
@@ -23,27 +21,90 @@ jobs:
         with:
           fetch-depth: 0
 
-      # ── Extract version from git tag ──────────────────────────────────────
-      - name: Extract version
+      # ── Calculate next version ────────────────────────────────────────────
+      - name: Calculate version
         id: version
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
+          # Get latest tag, default to v0.1.0 if none exists
+          LATEST_TAG=$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No tags found - starting at v0.1.0"
+            NEXT_VERSION="0.1.0"
+            PREV_TAG=""
+          else
+            echo "Latest tag: ${LATEST_TAG}"
+            PREV_TAG="${LATEST_TAG}"
+
+            # Parse version parts
+            VERSION="${LATEST_TAG#v}"
+            MAJOR=$(echo $VERSION | cut -d. -f1)
+            MINOR=$(echo $VERSION | cut -d. -f2)
+            PATCH=$(echo $VERSION | cut -d. -f3)
+
+            # Get commits since last tag
+            COMMITS=$(git log ${LATEST_TAG}..HEAD --pretty=format:"%s")
+
+            if [ -z "$COMMITS" ]; then
+              echo "No new commits since ${LATEST_TAG} - skipping release"
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            echo "Commits since ${LATEST_TAG}:"
+            echo "${COMMITS}"
+
+            # Determine bump type from commit messages
+            if echo "$COMMITS" | grep -qiE "BREAKING CHANGE|^break:|^breaking:"; then
+              BUMP="major"
+            elif echo "$COMMITS" | grep -qiE "^feat(\(.+\))?:|^feature:"; then
+              BUMP="minor"
+            else
+              BUMP="patch"
+            fi
+
+            echo "Bump type: ${BUMP}"
+
+            # Calculate next version
+            case $BUMP in
+              major)
+                NEXT_VERSION="$((MAJOR + 1)).0.0"
+                ;;
+              minor)
+                NEXT_VERSION="${MAJOR}.$((MINOR + 1)).0"
+                ;;
+              patch)
+                NEXT_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+                ;;
+            esac
+          fi
+
           COMMIT_SHA="${GITHUB_SHA::7}"
           BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          TAG="v${NEXT_VERSION}"
 
-          echo "tag=${TAG}"           >> $GITHUB_OUTPUT
-          echo "version=${VERSION}"   >> $GITHUB_OUTPUT
-          echo "commit=${COMMIT_SHA}" >> $GITHUB_OUTPUT
-          echo "date=${BUILD_DATE}"   >> $GITHUB_OUTPUT
+          echo "skip=false"          >> $GITHUB_OUTPUT
+          echo "tag=${TAG}"          >> $GITHUB_OUTPUT
+          echo "version=${NEXT_VERSION}" >> $GITHUB_OUTPUT
+          echo "commit=${COMMIT_SHA}"    >> $GITHUB_OUTPUT
+          echo "date=${BUILD_DATE}"      >> $GITHUB_OUTPUT
+          echo "prev_tag=${PREV_TAG}"    >> $GITHUB_OUTPUT
 
-          echo "▶ Tag:     ${TAG}"
-          echo "▶ Version: ${VERSION}"
-          echo "▶ Commit:  ${COMMIT_SHA}"
-          echo "▶ Date:    ${BUILD_DATE}"
+          echo "▶ Previous : ${LATEST_TAG:-none}"
+          echo "▶ Next     : ${TAG}"
+          echo "▶ Commit   : ${COMMIT_SHA}"
+          echo "▶ Date     : ${BUILD_DATE}"
+
+      # ── Skip if no new commits ────────────────────────────────────────────
+      - name: Check if release needed
+        if: steps.version.outputs.skip == 'true'
+        run: |
+          echo "No new commits since last release - skipping"
+          exit 0
 
       # ── Setup Go ──────────────────────────────────────────────────────────
       - name: Setup Go
+        if: steps.version.outputs.skip != 'true'
         uses: actions/setup-go@v6.4.0
         with:
           go-version-file: go.mod
@@ -51,10 +112,12 @@ jobs:
 
       # ── Run tests ─────────────────────────────────────────────────────────
       - name: Test
+        if: steps.version.outputs.skip != 'true'
         run: go test ./...
 
       # ── Build binary ──────────────────────────────────────────────────────
       - name: Build binary
+        if: steps.version.outputs.skip != 'true'
         run: |
           CGO_ENABLED=0 go build \
             -trimpath \
@@ -66,6 +129,7 @@ jobs:
 
       # ── Login to Docker Hub ───────────────────────────────────────────────
       - name: Login to Docker Hub
+        if: steps.version.outputs.skip != 'true'
         uses: docker/login-action@v4.1.0
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
@@ -73,10 +137,12 @@ jobs:
 
       # ── Setup Docker Buildx ───────────────────────────────────────────────
       - name: Setup Buildx
+        if: steps.version.outputs.skip != 'true'
         uses: docker/setup-buildx-action@v4
 
       # ── Build and push Docker image ───────────────────────────────────────
       - name: Build and push image
+        if: steps.version.outputs.skip != 'true'
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -90,15 +156,25 @@ jobs:
             ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
             ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
             ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.commit }}
-
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # ── Create git tag ────────────────────────────────────────────────────
+      - name: Create git tag
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ steps.version.outputs.tag }}
+          git push origin ${{ steps.version.outputs.tag }}
+
       # ── Generate changelog ────────────────────────────────────────────────
       - name: Generate changelog
+        if: steps.version.outputs.skip != 'true'
         id: changelog
         run: |
-          PREV_TAG=$(git tag --sort=-version:refname | sed -n '2p')
+          PREV_TAG="${{ steps.version.outputs.prev_tag }}"
+
           if [ -z "$PREV_TAG" ]; then
             COMMITS=$(git log --pretty=format:"- %s (%h)" HEAD)
           else
@@ -111,6 +187,7 @@ jobs:
 
       # ── Create GitHub Release ─────────────────────────────────────────────
       - name: Create GitHub Release
+        if: steps.version.outputs.skip != 'true'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.version.outputs.tag }}
