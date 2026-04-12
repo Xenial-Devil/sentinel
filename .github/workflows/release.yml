@@ -1,7 +1,10 @@
 name: Release
 
 on:
-  push:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
     branches: ["main"]
 
 env:
@@ -11,6 +14,9 @@ jobs:
   release:
     name: Build & Release
     runs-on: ubuntu-latest
+
+    # Only run if CI passed
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     permissions:
       contents: write
@@ -25,7 +31,6 @@ jobs:
       - name: Calculate version
         id: version
         run: |
-          # Get latest tag, default to v0.1.0 if none exists
           LATEST_TAG=$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
 
           if [ -z "$LATEST_TAG" ]; then
@@ -36,13 +41,11 @@ jobs:
             echo "Latest tag: ${LATEST_TAG}"
             PREV_TAG="${LATEST_TAG}"
 
-            # Parse version parts
             VERSION="${LATEST_TAG#v}"
             MAJOR=$(echo $VERSION | cut -d. -f1)
             MINOR=$(echo $VERSION | cut -d. -f2)
             PATCH=$(echo $VERSION | cut -d. -f3)
 
-            # Get commits since last tag
             COMMITS=$(git log ${LATEST_TAG}..HEAD --pretty=format:"%s")
 
             if [ -z "$COMMITS" ]; then
@@ -54,7 +57,6 @@ jobs:
             echo "Commits since ${LATEST_TAG}:"
             echo "${COMMITS}"
 
-            # Determine bump type from commit messages
             if echo "$COMMITS" | grep -qiE "BREAKING CHANGE|^break:|^breaking:"; then
               BUMP="major"
             elif echo "$COMMITS" | grep -qiE "^feat(\(.+\))?:|^feature:"; then
@@ -65,7 +67,6 @@ jobs:
 
             echo "Bump type: ${BUMP}"
 
-            # Calculate next version
             case $BUMP in
               major)
                 NEXT_VERSION="$((MAJOR + 1)).0.0"
@@ -83,8 +84,8 @@ jobs:
           BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
           TAG="v${NEXT_VERSION}"
 
-          echo "skip=false"          >> $GITHUB_OUTPUT
-          echo "tag=${TAG}"          >> $GITHUB_OUTPUT
+          echo "skip=false"              >> $GITHUB_OUTPUT
+          echo "tag=${TAG}"             >> $GITHUB_OUTPUT
           echo "version=${NEXT_VERSION}" >> $GITHUB_OUTPUT
           echo "commit=${COMMIT_SHA}"    >> $GITHUB_OUTPUT
           echo "date=${BUILD_DATE}"      >> $GITHUB_OUTPUT
@@ -109,11 +110,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-
-      # ── Run tests ─────────────────────────────────────────────────────────
-      - name: Test
-        if: steps.version.outputs.skip != 'true'
-        run: go test ./...
 
       # ── Build binary ──────────────────────────────────────────────────────
       - name: Build binary
