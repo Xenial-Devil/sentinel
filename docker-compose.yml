@@ -14,7 +14,7 @@ services:
       SENTINEL_API_PORT: "8080"
       SENTINEL_METRICS_ENABLED: "true"
       SENTINEL_METRICS_PORT: "9090"
-      SENTINEL_WATCH_ALL: "false"
+      SENTINEL_WATCH_ALL: "true"
       SENTINEL_LABEL_ENABLE: "true"
       SENTINEL_WATCH_LABEL: com.sentinel.watch.enable
       SENTINEL_WATCH_LABEL_VALUE: "true"

@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  IMAGE_NAME: sentinel
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+
+jobs:
+  release:
+    name: Build & Release
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── Extract version from git tag ──────────────────────────────────────
+      - name: Extract version
+        id: version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          COMMIT_SHA="${GITHUB_SHA::7}"
+          BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+          echo "tag=${TAG}"           >> $GITHUB_OUTPUT
+          echo "version=${VERSION}"   >> $GITHUB_OUTPUT
+          echo "commit=${COMMIT_SHA}" >> $GITHUB_OUTPUT
+          echo "date=${BUILD_DATE}"   >> $GITHUB_OUTPUT
+
+          echo "▶ Tag:     ${TAG}"
+          echo "▶ Version: ${VERSION}"
+          echo "▶ Commit:  ${COMMIT_SHA}"
+          echo "▶ Date:    ${BUILD_DATE}"
+
+      # ── Setup Go ──────────────────────────────────────────────────────────
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # ── Run tests ─────────────────────────────────────────────────────────
+      - name: Test
+        run: go test ./...
+
+      # ── Build binary ──────────────────────────────────────────────────────
+      - name: Build binary
+        run: |
+          CGO_ENABLED=0 go build \
+            -trimpath \
+            -ldflags "-s -w -buildid= \
+              -X main.Version=${{ steps.version.outputs.version }} \
+              -X main.CommitSHA=${{ steps.version.outputs.commit }} \
+              -X main.BuildDate=${{ steps.version.outputs.date }}" \
+            -o sentinel .
+
+      # ── Login to Docker Hub ───────────────────────────────────────────────
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      # ── Setup Docker Buildx ───────────────────────────────────────────────
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── Build and push Docker image ───────────────────────────────────────
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+            COMMIT_SHA=${{ steps.version.outputs.commit }}
+            BUILD_DATE=${{ steps.version.outputs.date }}
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+            ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.commit }}
+
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Generate changelog ────────────────────────────────────────────────
+      - name: Generate changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git tag --sort=-version:refname | sed -n '2p')
+          if [ -z "$PREV_TAG" ]; then
+            COMMITS=$(git log --pretty=format:"- %s (%h)" HEAD)
+          else
+            COMMITS=$(git log --pretty=format:"- %s (%h)" ${PREV_TAG}..HEAD)
+          fi
+
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "${COMMITS}"     >> $GITHUB_OUTPUT
+          echo "EOF"            >> $GITHUB_OUTPUT
+
+      # ── Create GitHub Release ─────────────────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "🛡 Sentinel ${{ steps.version.outputs.tag }}"
+          body: |
+            ## 🛡 Sentinel ${{ steps.version.outputs.tag }}
+
+            ### 📦 Docker Hub
+            ```bash
+            docker pull ${{ secrets.DOCKER_USERNAME }}/sentinel:${{ steps.version.outputs.version }}
+            ```
+
+            ### 🐳 Docker Compose
+            ```yaml
+            services:
+              sentinel:
+                image: ${{ secrets.DOCKER_USERNAME }}/sentinel:${{ steps.version.outputs.version }}
+            ```
+
+            ### 📋 Changes
+            ${{ steps.changelog.outputs.changelog }}
+
+            ### 🔍 Build Info
+            - Version : `${{ steps.version.outputs.version }}`
+            - Commit  : `${{ steps.version.outputs.commit }}`
+            - Date    : `${{ steps.version.outputs.date }}`
+          files: sentinel
+          generate_release_notes: false

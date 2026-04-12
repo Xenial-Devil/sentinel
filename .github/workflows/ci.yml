@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "dev"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  ci:
+    name: Test & Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: latest
+
+      - name: Test
+        run: go test -v -race ./...
+
+      # ── Extract build info ────────────────────────────────────────────────
+      - name: Extract build info
+        id: info
+        run: |
+          COMMIT_SHA="${GITHUB_SHA::7}"
+          BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          BRANCH="${GITHUB_REF_NAME}"
+
+          # CI builds use branch+sha as version e.g. "main-abc1234"
+          VERSION="${BRANCH}-${COMMIT_SHA}"
+
+          echo "version=${VERSION}"   >> $GITHUB_OUTPUT
+          echo "commit=${COMMIT_SHA}" >> $GITHUB_OUTPUT
+          echo "date=${BUILD_DATE}"   >> $GITHUB_OUTPUT
+
+          echo "▶ Version: ${VERSION}"
+          echo "▶ Commit:  ${COMMIT_SHA}"
+          echo "▶ Date:    ${BUILD_DATE}"
+
+      # ── Build check ───────────────────────────────────────────────────────
+      - name: Build check
+        run: |
+          CGO_ENABLED=0 go build \
+            -trimpath \
+            -ldflags "-s -w -buildid= \
+              -X main.Version=${{ steps.info.outputs.version }} \
+              -X main.CommitSHA=${{ steps.info.outputs.commit }} \
+              -X main.BuildDate=${{ steps.info.outputs.date }}" \
+            -o sentinel .
+
+      # ── Verify binary ─────────────────────────────────────────────────────
+      - name: Verify binary
+        run: |
+          ls -lah sentinel
+          file sentinel
