@@ -39,6 +39,9 @@ func New(cfg *config.Config) (*Client, error) {
 
 // Close closes the Docker client
 func (c *Client) Close() {
-	c.CLI.Close()
+	// error is intentionally ignored on close - nothing actionable to do
+	if err := c.CLI.Close(); err != nil {
+		logger.Log.Warnf("Docker client close error: %v", err)
+	}
 	logger.Log.Info("Docker client closed")
 }

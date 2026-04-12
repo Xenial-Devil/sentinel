@@ -47,7 +47,6 @@ func (u *Updater) CheckAndUpdate(ct docker.ContainerInfo) UpdateResult {
 		Image:         ct.Image,
 	}
 
-	// Get local image digest
 	localDigest, err := u.getLocalDigest(ct.ImageID)
 	if err != nil {
 		logger.Log.Errorf("Failed to get local digest for %s: %v", ct.Name, err)
@@ -55,7 +54,6 @@ func (u *Updater) CheckAndUpdate(ct docker.ContainerInfo) UpdateResult {
 		return result
 	}
 
-	// Check registry for update
 	hasUpdate, newTag, err := u.Registry.HasUpdate(localDigest, ct.Image)
 	if err != nil {
 		logger.Log.Warnf("Failed to check registry for %s: %v", ct.Name, err)
@@ -63,13 +61,11 @@ func (u *Updater) CheckAndUpdate(ct docker.ContainerInfo) UpdateResult {
 		return result
 	}
 
-	// No update available
 	if !hasUpdate {
 		logger.Log.Infof("No update for %s", ct.Name)
 		return result
 	}
 
-	// Check semver policy before applying update
 	currentTag := GetTagFromImage(ct.Image)
 	policy := Policy(u.Config.SemverPolicy)
 	allowed, err := CheckVersionPolicy(currentTag, newTag, policy)
@@ -82,7 +78,6 @@ func (u *Updater) CheckAndUpdate(ct docker.ContainerInfo) UpdateResult {
 		return result
 	}
 
-	// Update available and allowed - apply it
 	logger.Log.Infof("Update found for %s (%s -> %s) - applying...", ct.Name, currentTag, newTag)
 	err = u.applyUpdate(ct)
 	if err != nil {
@@ -98,34 +93,29 @@ func (u *Updater) CheckAndUpdate(ct docker.ContainerInfo) UpdateResult {
 
 // applyUpdate pulls new image and recreates container
 func (u *Updater) applyUpdate(ct docker.ContainerInfo) error {
-	// Step 1: Inspect current container to save settings
 	info, err := u.Client.InspectContainer(ct.ID)
 	if err != nil {
 		return fmt.Errorf("failed to inspect container: %v", err)
 	}
 
-	// Step 2: Pull new image
 	logger.Log.Infof("Pulling new image: %s", ct.Image)
 	err = u.pullImage(ct.Image)
 	if err != nil {
 		return fmt.Errorf("failed to pull image: %v", err)
 	}
 
-	// Step 3: Stop old container
 	logger.Log.Infof("Stopping container: %s", ct.Name)
 	err = u.Client.StopContainer(ct.ID, u.Config.StopTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to stop container: %v", err)
 	}
 
-	// Step 4: Remove old container
 	logger.Log.Infof("Removing old container: %s", ct.Name)
 	err = u.Client.RemoveContainer(ct.ID)
 	if err != nil {
 		return fmt.Errorf("failed to remove container: %v", err)
 	}
 
-	// Step 5: Recreate container with same settings
 	logger.Log.Infof("Recreating container: %s", ct.Name)
 	err = u.recreateContainer(ct.Name, info)
 	if err != nil {
@@ -139,7 +129,6 @@ func (u *Updater) applyUpdate(ct docker.ContainerInfo) error {
 func (u *Updater) pullImage(image string) error {
 	ctx := context.Background()
 
-	// Pull the image
 	reader, err := u.Client.CLI.ImagePull(
 		ctx,
 		image,
@@ -148,9 +137,12 @@ func (u *Updater) pullImage(image string) error {
 	if err != nil {
 		return err
 	}
-	defer reader.Close()
+	defer func() {
+		if err := reader.Close(); err != nil {
+			logger.Log.Warnf("Failed to close image pull reader: %v", err)
+		}
+	}()
 
-	// Stream pull progress to logger
 	decoder := json.NewDecoder(reader)
 	for {
 		var event map[string]interface{}
@@ -161,7 +153,6 @@ func (u *Updater) pullImage(image string) error {
 			return err
 		}
 
-		// Log pull progress
 		if status, ok := event["status"].(string); ok {
 			if id, ok := event["id"].(string); ok {
 				logger.Log.Debugf("Pull: %s - %s", id, status)
@@ -177,16 +168,13 @@ func (u *Updater) pullImage(image string) error {
 func (u *Updater) recreateContainer(name string, info dockertypes.ContainerJSON) error {
 	ctx := context.Background()
 
-	// Build container config from old container
 	containerConfig := info.Config
 	hostConfig := info.HostConfig
 
-	// Build network config
 	networkConfig := &network.NetworkingConfig{
 		EndpointsConfig: info.NetworkSettings.Networks,
 	}
 
-	// Create new container
 	resp, err := u.Client.CLI.ContainerCreate(
 		ctx,
 		containerConfig,
@@ -199,7 +187,6 @@ func (u *Updater) recreateContainer(name string, info dockertypes.ContainerJSON)
 		return fmt.Errorf("failed to create container: %v", err)
 	}
 
-	// Start new container
 	err = u.Client.CLI.ContainerStart(
 		ctx,
 		resp.ID,
@@ -222,7 +209,6 @@ func (u *Updater) getLocalDigest(imageID string) (string, error) {
 		return "", err
 	}
 
-	// RepoDigests format: "image@sha256:abc..." — extract just the sha256 digest
 	if len(inspect.RepoDigests) > 0 {
 		parts := strings.SplitN(inspect.RepoDigests[0], "@", 2)
 		if len(parts) == 2 {
@@ -231,7 +217,6 @@ func (u *Updater) getLocalDigest(imageID string) (string, error) {
 		return inspect.RepoDigests[0], nil
 	}
 
-	// Fall back to image ID (freshly built images have no RepoDigest yet)
 	return inspect.ID, nil
 }
 

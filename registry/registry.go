@@ -32,10 +32,7 @@ func New() *Client {
 }
 
 // ParseImage splits image name into parts
-// Example: postgres:17-alpine -> name=postgres tag=17-alpine
 func ParseImage(image string) (string, string) {
-	// Handle images with registry prefix
-	// Example: docker.io/library/postgres:17-alpine
 	parts := strings.Split(image, ":")
 
 	name := parts[0]
@@ -52,10 +49,8 @@ func ParseImage(image string) (string, string) {
 func (c *Client) GetRemoteDigest(image string) (string, error) {
 	name, tag := ParseImage(image)
 
-	// Clean up name for Docker Hub
 	registryName := cleanImageName(name)
 
-	// Build registry URL
 	url := fmt.Sprintf(
 		"https://registry-1.docker.io/v2/%s/manifests/%s",
 		registryName,
@@ -64,14 +59,12 @@ func (c *Client) GetRemoteDigest(image string) (string, error) {
 
 	logger.Log.Debugf("Checking registry: %s", url)
 
-	// Get auth token first
 	token, err := getAuthToken(registryName, c.HTTPClient)
 	if err != nil {
 		logger.Log.Errorf("Failed to get auth token: %v", err)
 		return "", err
 	}
 
-	// Create request
 	req, err := http.NewRequestWithContext(
 		context.Background(),
 		http.MethodHead,
@@ -82,23 +75,24 @@ func (c *Client) GetRemoteDigest(image string) (string, error) {
 		return "", err
 	}
 
-	// Set headers
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
 
-	// Make request
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		logger.Log.Errorf("Failed to reach registry: %v", err)
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			logger.Log.Warnf("Failed to close response body: %v", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("registry returned status: %d", resp.StatusCode)
 	}
 
-	// Get digest from header
 	digest := resp.Header.Get("Docker-Content-Digest")
 	if digest == "" {
 		return "", fmt.Errorf("no digest in response")
@@ -115,7 +109,6 @@ func (c *Client) HasUpdate(localDigest string, image string) (bool, string, erro
 		return false, "", err
 	}
 
-	// Compare digests
 	if remoteDigest != localDigest {
 		logger.Log.Infof("Update available for %s", image)
 		return true, remoteDigest, nil
@@ -127,11 +120,8 @@ func (c *Client) HasUpdate(localDigest string, image string) (bool, string, erro
 
 // cleanImageName formats image name for Docker Hub API
 func cleanImageName(name string) string {
-	// Remove docker.io prefix
 	name = strings.TrimPrefix(name, "docker.io/")
 
-	// Add library/ prefix for official images
-	// Example: postgres -> library/postgres
 	if !strings.Contains(name, "/") {
 		name = "library/" + name
 	}
@@ -150,9 +140,12 @@ func getAuthToken(image string, client *http.Client) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			logger.Log.Warnf("Failed to close auth response body: %v", err)
+		}
+	}()
 
-	// Parse token response
 	var result struct {
 		Token string `json:"token"`
 	}

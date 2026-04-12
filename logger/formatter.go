@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"sort"
-	"strings"
 
 	"github.com/sirupsen/logrus"
 )
@@ -53,7 +52,6 @@ func (f *SentinelFormatter) Format(entry *logrus.Entry) ([]byte, error) {
 	if len(entry.Data) > 0 {
 		b.WriteString(colorDarkGray + "  │" + colorReset)
 
-		// Sort fields: priority keys first
 		keys := sortedKeys(entry.Data)
 
 		for _, k := range keys {
@@ -63,7 +61,7 @@ func (f *SentinelFormatter) Format(entry *logrus.Entry) ([]byte, error) {
 			b.WriteString(k)
 			b.WriteString(colorDarkGray + "=" + colorReset)
 			b.WriteString(valueColor(k, entry.Level))
-			b.WriteString(fmt.Sprintf("%v", v))
+			fmt.Fprintf(&b, "%v", v) // ← fixed: use fmt.Fprintf instead of WriteString(fmt.Sprintf)
 			b.WriteString(colorReset)
 		}
 	}
@@ -190,7 +188,6 @@ func sortedKeys(data logrus.Fields) []string {
 	seen := make(map[string]bool)
 	var result []string
 
-	// Priority keys first
 	for _, k := range priorityKeys {
 		if _, ok := data[k]; ok {
 			result = append(result, k)
@@ -198,7 +195,6 @@ func sortedKeys(data logrus.Fields) []string {
 		}
 	}
 
-	// Remaining keys alphabetically
 	var rest []string
 	for k := range data {
 		if !seen[k] {
@@ -209,9 +205,4 @@ func sortedKeys(data logrus.Fields) []string {
 	result = append(result, rest...)
 
 	return result
-}
-
-// separator returns a visual divider line
-func separator() string {
-	return colorDarkGray + strings.Repeat("─", 80) + colorReset
 }

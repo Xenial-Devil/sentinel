@@ -15,10 +15,7 @@ import (
 )
 
 const (
-	// SentinelVersion is the current version
 	SentinelVersion = "1.0.0"
-
-	// SignatureHeader is the header name for webhook signature
 	SignatureHeader = "X-Sentinel-Signature"
 )
 
@@ -40,9 +37,8 @@ func New(url string, secret string) *Client {
 	}
 }
 
-// Send sends a webhook event to external system
+// Send sends a webhook event
 func (c *Client) Send(event EventType, containerName string, image string) error {
-	// Build payload
 	payload := Payload{
 		Event:         event,
 		Timestamp:     time.Now(),
@@ -103,13 +99,11 @@ func (c *Client) SendWithError(
 
 // sendPayload marshals and sends the payload
 func (c *Client) sendPayload(payload Payload) error {
-	// Marshal payload
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal webhook payload: %v", err)
 	}
 
-	// Create request
 	req, err := http.NewRequestWithContext(
 		context.Background(),
 		http.MethodPost,
@@ -120,24 +114,24 @@ func (c *Client) sendPayload(payload Payload) error {
 		return fmt.Errorf("failed to create webhook request: %v", err)
 	}
 
-	// Set headers
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "Sentinel/"+SentinelVersion)
 
-	// Sign request if secret configured
 	if c.Secret != "" {
 		signature := c.signPayload(data)
 		req.Header.Set(SignatureHeader, signature)
 	}
 
-	// Send request
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to send webhook: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			logger.Log.Warnf("Failed to close webhook response body: %v", err)
+		}
+	}()
 
-	// Check response
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return fmt.Errorf("webhook returned status: %d", resp.StatusCode)
 	}
