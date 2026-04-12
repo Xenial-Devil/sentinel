@@ -28,6 +28,10 @@ func main() {
 	logger.Log.Infof("Poll Interval: %d seconds", cfg.PollInterval)
 	logger.Log.Infof("Monitor Only: %v", cfg.MonitorOnly)
 	logger.Log.Infof("Watch All:    %v", cfg.WatchAll)
+	logger.Log.Infof("Label Enable: %v", cfg.LabelEnable)
+	if cfg.LabelEnable {
+		logger.Log.Infof("Watch Label:  %s=%s", cfg.WatchLabel, cfg.WatchLabelValue)
+	}
 
 	// Connect to Docker
 	client, err := docker.New(cfg)

@@ -17,7 +17,7 @@ type ContainerInfo struct {
 	ImageID string
 	Status  string
 	Running bool
-	Labels  map[string]string
+	Labels  map[string]string // merged: container labels + image labels
 }
 
 // ListContainers returns all running containers
@@ -41,6 +41,10 @@ func (c *Client) ListContainers(includeStopped bool) ([]ContainerInfo, error) {
 			name = ct.Names[0][1:]
 		}
 
+		// Merge container labels + image labels
+		// Container labels take priority over image labels
+		mergedLabels := c.mergeLabels(ctx, ct.ID, ct.Labels)
+
 		result = append(result, ContainerInfo{
 			ID:      ct.ID[:12],
 			Name:    name,
@@ -48,12 +52,43 @@ func (c *Client) ListContainers(includeStopped bool) ([]ContainerInfo, error) {
 			ImageID: ct.ImageID,
 			Status:  ct.Status,
 			Running: ct.State == "running",
-			Labels:  ct.Labels,
+			Labels:  mergedLabels,
 		})
 	}
 
 	logger.Log.Debugf("Found %d containers", len(result))
 	return result, nil
+}
+
+// mergeLabels merges image labels (base) with container labels (override)
+// Container labels always win over image labels
+func (c *Client) mergeLabels(ctx context.Context, containerID string, containerLabels map[string]string) map[string]string {
+	merged := make(map[string]string)
+
+	// First inspect the image to get image-level labels
+	inspect, err := c.CLI.ContainerInspect(ctx, containerID)
+	if err != nil {
+		logger.Log.Debugf("Could not inspect container %s for image labels: %v", containerID[:12], err)
+		// Fall back to container labels only
+		for k, v := range containerLabels {
+			merged[k] = v
+		}
+		return merged
+	}
+
+	// Layer 1: image labels (lowest priority)
+	if inspect.Config != nil {
+		for k, v := range inspect.Config.Labels {
+			merged[k] = v
+		}
+	}
+
+	// Layer 2: container labels (highest priority, overrides image labels)
+	for k, v := range containerLabels {
+		merged[k] = v
+	}
+
+	return merged
 }
 
 // InspectContainer returns detailed info about a container
@@ -140,6 +175,8 @@ func (c *Client) GetContainersByLabel(labelKey string, labelValue string) ([]Con
 			name = ct.Names[0][1:]
 		}
 
+		mergedLabels := c.mergeLabels(ctx, ct.ID, ct.Labels)
+
 		result = append(result, ContainerInfo{
 			ID:      ct.ID[:12],
 			Name:    name,
@@ -147,7 +184,7 @@ func (c *Client) GetContainersByLabel(labelKey string, labelValue string) ([]Con
 			ImageID: ct.ImageID,
 			Status:  ct.Status,
 			Running: ct.State == "running",
-			Labels:  ct.Labels,
+			Labels:  mergedLabels,
 		})
 	}
 

@@ -86,10 +86,13 @@ func (a *API) handleInfo(w http.ResponseWriter, r *http.Request) {
 		Success: true,
 		Message: "Sentinel info",
 		Data: map[string]interface{}{
-			"version":       "1.0.0",
-			"poll_interval": a.Config.PollInterval,
-			"monitor_only":  a.Config.MonitorOnly,
-			"watch_all":     a.Config.WatchAll,
+			"version":           "1.0.0",
+			"poll_interval":     a.Config.PollInterval,
+			"monitor_only":      a.Config.MonitorOnly,
+			"watch_all":         a.Config.WatchAll,
+			"label_enable":      a.Config.LabelEnable,
+			"watch_label":       a.Config.WatchLabel,
+			"watch_label_value": a.Config.WatchLabelValue,
 		},
 		Timestamp: time.Now(),
 	})
@@ -275,6 +278,7 @@ func (a *API) handleGetStacks(w http.ResponseWriter, r *http.Request) {
 		Timestamp: time.Now(),
 	})
 }
+
 // writeJSON writes JSON response
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -283,5 +287,5 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	if err := json.NewEncoder(w).Encode(data); err != nil {
 		logger.Log.Errorf("Failed to write JSON response: %v", err)
 	}
-	
+
 }

@@ -14,11 +14,14 @@ type Config struct {
 	DockerCertPath  string
 
 	// Watcher settings
-	PollInterval   int
-	CronSchedule   string
-	WatchAll       bool
-	MonitorOnly    bool
-	IncludeStopped bool
+	PollInterval    int
+	CronSchedule    string
+	WatchAll        bool
+	LabelEnable     bool
+	WatchLabel      string
+	WatchLabelValue string
+	MonitorOnly     bool
+	IncludeStopped  bool
 
 	// Update settings
 	Cleanup        bool
@@ -50,8 +53,8 @@ type Config struct {
 	MetricsPort    int
 
 	// Webhook settings
-    WebhookURL    string
-    WebhookSecret string
+	WebhookURL    string
+	WebhookSecret string
 	// Approval settings
 	ApprovalFilePath string
 }
@@ -79,11 +82,14 @@ func Load() *Config {
 		DockerCertPath:  getEnv("SENTINEL_CERT_PATH", ""),
 
 		// Watcher settings
-		PollInterval:   getIntEnv("SENTINEL_POLL_INTERVAL", 30),
-		CronSchedule:   getEnv("SENTINEL_CRON", ""),
-		WatchAll:       getBoolEnv("SENTINEL_WATCH_ALL", true),
-		MonitorOnly:    getBoolEnv("SENTINEL_MONITOR_ONLY", false),
-		IncludeStopped: getBoolEnv("SENTINEL_INCLUDE_STOPPED", false),
+		PollInterval:    getIntEnv("SENTINEL_POLL_INTERVAL", 30),
+		CronSchedule:    getEnv("SENTINEL_CRON", ""),
+		WatchAll:        getBoolEnv("SENTINEL_WATCH_ALL", false),
+		LabelEnable:     getBoolEnv("SENTINEL_LABEL_ENABLE", true),
+		WatchLabel:      getEnv("SENTINEL_WATCH_LABEL", "com.sentinel.watch.enable"),
+		WatchLabelValue: getEnv("SENTINEL_WATCH_LABEL_VALUE", "true"),
+		MonitorOnly:     getBoolEnv("SENTINEL_MONITOR_ONLY", false),
+		IncludeStopped:  getBoolEnv("SENTINEL_INCLUDE_STOPPED", false),
 
 		// Update settings
 		Cleanup:        getBoolEnv("SENTINEL_CLEANUP", true),
@@ -118,7 +124,6 @@ func Load() *Config {
 		WebhookSecret: getEnv("SENTINEL_WEBHOOK_SECRET", ""),
 		// Approval settings
 		ApprovalFilePath: getEnv("SENTINEL_APPROVAL_FILE", "approvals.json"),
-		
 	}
 }
 
