@@ -1,0 +1,48 @@
+services:
+  sentinel:
+    container_name: sentinel
+    image: sentinel:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+
+    environment:
+      SENTINEL_DOCKER_HOST: unix:///var/run/docker.sock
+      SENTINEL_API_ENABLED: "true"
+      SENTINEL_API_PORT: "8080"
+      SENTINEL_METRICS_ENABLED: "true"
+      SENTINEL_METRICS_PORT: "9090"
+      SENTINEL_APPROVAL_FILE: /app/data/approvals.json
+      SENTINEL_LOG_LEVEL: info
+      SENTINEL_LOG_FORMAT: pretty
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/app/data
+
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://127.0.0.1:$${SENTINEL_API_PORT:-8080}/health >/dev/null 2>&1 || wget -qO- http://127.0.0.1:$${SENTINEL_METRICS_PORT:-9090}/health >/dev/null 2>&1 || exit 1",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+    stop_grace_period: 20s
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

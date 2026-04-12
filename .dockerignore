@@ -1,0 +1,21 @@
+.git
+.gitignore
+.vscode
+.idea
+
+# Build/test artifacts
+bin/
+dist/
+coverage/
+*.log
+
+# Runtime/state data
+data/
+
+# Local environment files
+.env
+.env.*
+
+# Non-runtime docs
+README*
+*.md
