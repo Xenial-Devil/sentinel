@@ -9,17 +9,10 @@ import (
 
 // SmokeTest defines a smoke test for a container
 type SmokeTest struct {
-	// URL to test
-	URL string
-
-	// Expected status code
+	URL            string
 	ExpectedStatus int
-
-	// Timeout in seconds
-	Timeout int
-
-	// Retries before failing
-	Retries int
+	Timeout        int
+	Retries        int
 }
 
 // SmokeResult holds smoke test result
@@ -48,7 +41,6 @@ func NewRunner(timeout int) *Runner {
 func (r *Runner) Run(test SmokeTest) SmokeResult {
 	result := SmokeResult{}
 
-	// Set defaults
 	if test.ExpectedStatus == 0 {
 		test.ExpectedStatus = http.StatusOK
 	}
@@ -56,7 +48,6 @@ func (r *Runner) Run(test SmokeTest) SmokeResult {
 		test.Retries = 3
 	}
 
-	// Try with retries
 	for attempt := 1; attempt <= test.Retries; attempt++ {
 		logger.Log.Debugf("Smoke test attempt %d/%d: %s",
 			attempt,
@@ -74,7 +65,6 @@ func (r *Runner) Run(test SmokeTest) SmokeResult {
 			return result
 		}
 
-		// Wait before retry
 		if attempt < test.Retries {
 			logger.Log.Warnf("Smoke test failed attempt %d - retrying...", attempt)
 			time.Sleep(2 * time.Second)
@@ -111,7 +101,6 @@ func (r *Runner) doRequest(test SmokeTest) SmokeResult {
 	start := time.Now()
 	result := SmokeResult{}
 
-	// Make request
 	resp, err := r.HTTPClient.Get(test.URL)
 	result.Duration = time.Since(start)
 
@@ -120,11 +109,14 @@ func (r *Runner) doRequest(test SmokeTest) SmokeResult {
 		result.Error = fmt.Sprintf("request failed: %v", err)
 		return result
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			logger.Log.Warnf("Failed to close smoke test response body: %v", err)
+		}
+	}()
 
 	result.StatusCode = resp.StatusCode
 
-	// Check status code
 	if resp.StatusCode != test.ExpectedStatus {
 		result.Passed = false
 		result.Error = fmt.Sprintf(
@@ -140,19 +132,16 @@ func (r *Runner) doRequest(test SmokeTest) SmokeResult {
 }
 
 // BuildSmokeTest builds a smoke test from container labels
-// Label: sentinel.smoke-test.url=http://localhost:8080/health
 func BuildSmokeTest(labels map[string]string) *SmokeTest {
 	url, ok := labels["sentinel.smoke-test.url"]
 	if !ok {
 		return nil
 	}
 
-	test := &SmokeTest{
+	return &SmokeTest{
 		URL:            url,
 		ExpectedStatus: http.StatusOK,
 		Timeout:        10,
 		Retries:        3,
 	}
-
-	return test
 }

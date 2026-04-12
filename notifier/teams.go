@@ -42,7 +42,6 @@ func NewTeams(webhookURL string) *TeamsNotifier {
 
 // Send sends a notification to Teams
 func (t *TeamsNotifier) Send(n Notification, message string) error {
-	// Build teams message
 	msg := TeamsMessage{
 		Type:       "MessageCard",
 		Context:    "http://schema.org/extensions",
@@ -56,13 +55,11 @@ func (t *TeamsNotifier) Send(n Notification, message string) error {
 		},
 	}
 
-	// Marshal to JSON
 	payload, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("failed to marshal teams message: %v", err)
 	}
 
-	// Send request
 	resp, err := t.HTTPClient.Post(
 		t.WebhookURL,
 		"application/json",
@@ -71,7 +68,11 @@ func (t *TeamsNotifier) Send(n Notification, message string) error {
 	if err != nil {
 		return fmt.Errorf("failed to send teams message: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			logger.Log.Warnf("Failed to close teams response body: %v", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("teams returned status: %d", resp.StatusCode)
@@ -85,14 +86,14 @@ func (t *TeamsNotifier) Send(n Notification, message string) error {
 func getTeamsColor(event EventType) string {
 	switch event {
 	case EventUpdateSuccess:
-		return "00FF00" // green
+		return "00FF00"
 	case EventUpdateFailed:
-		return "FF0000" // red
+		return "FF0000"
 	case EventRollback:
-		return "FFA500" // orange
+		return "FFA500"
 	case EventHealthFailed:
-		return "FF0000" // red
+		return "FF0000"
 	default:
-		return "0078D7" // blue
+		return "0078D7"
 	}
 }
