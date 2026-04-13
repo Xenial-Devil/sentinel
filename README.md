@@ -59,7 +59,7 @@ Sentinel is configured entirely via environment variables.
 
 | Variable                     | Default                       | Description                                       |
 | ---------------------------- | ----------------------------- | ------------------------------------------------- |
-| `SENTINEL_DOCKER_HOST`       | `unix:///var/run/docker.sock` | Docker socket path or host                        |
+| `SENTINEL_DOCKER_HOST`       | `auto detected`               | Docker socket path or host                        |
 | `SENTINEL_POLL_INTERVAL`     | `30`                          | Check interval in seconds                         |
 | `SENTINEL_CRON`              | `""`                          | Optional cron schedule (e.g., `0 * * * *`)        |
 | `SENTINEL_WATCH_ALL`         | `false`                       | Monitor all containers by default                 |
@@ -95,7 +95,7 @@ services:
 Notes:
 
 - Legacy label `sentinel.enable=true` is still supported.
-- For compatibility, Sentinel also accepts `com.swntinel.watch.enable=true`.
+- For compatibility, Sentinel also accepts `com.sentinel.watch.enable=true`.
 
 ---
 

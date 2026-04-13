@@ -39,17 +39,29 @@ type Manager struct {
 	filePath string
 }
 
-// New creates a new approval Manager
+// singleton instance shared across watcher and API
+var (
+	instance *Manager
+	once     sync.Once
+)
+
+// GetInstance returns the shared singleton approval manager
+func GetInstance(filePath string) *Manager {
+	once.Do(func() {
+		instance = &Manager{
+			requests: make(map[string]*Request),
+			filePath: filePath,
+		}
+		instance.load()
+		logger.Log.WithField("file", filePath).
+			Info("✋  Approval manager initialized")
+	})
+	return instance
+}
+
+// New creates a new approval Manager (use GetInstance for shared state)
 func New(filePath string) *Manager {
-	m := &Manager{
-		requests: make(map[string]*Request),
-		filePath: filePath,
-	}
-
-	// Load existing requests from file
-	m.load()
-
-	return m
+	return GetInstance(filePath)
 }
 
 // RequestApproval creates a new approval request
@@ -61,10 +73,9 @@ func (m *Manager) RequestApproval(
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Build unique ID
 	id := buildID(containerName, newImage)
 
-	// Check if already pending
+	// Return existing pending request
 	if existing, ok := m.requests[id]; ok {
 		if existing.Status == StatusPending {
 			logger.Log.Infof("Approval already pending for %s", containerName)
@@ -72,7 +83,6 @@ func (m *Manager) RequestApproval(
 		}
 	}
 
-	// Create new request
 	req := &Request{
 		ID:            id,
 		ContainerName: containerName,
@@ -84,15 +94,13 @@ func (m *Manager) RequestApproval(
 	}
 
 	m.requests[id] = req
-
-	// Save to file
 	m.save()
 
-	logger.Log.Infof("Approval requested for %s: %s -> %s",
-		containerName,
-		currentImage,
-		newImage,
-	)
+	logger.Log.WithFields(logger.Fields{
+		"container":     containerName,
+		"current_image": currentImage,
+		"new_image":     newImage,
+	}).Info("⏳  Approval requested")
 
 	return req
 }
@@ -111,7 +119,6 @@ func (m *Manager) Approve(id string) error {
 		return fmt.Errorf("request is not pending: %s", req.Status)
 	}
 
-	// Check if expired
 	if time.Now().After(req.ExpiresAt) {
 		req.Status = StatusExpired
 		m.save()
@@ -120,13 +127,12 @@ func (m *Manager) Approve(id string) error {
 
 	req.Status = StatusApproved
 	req.ApprovedAt = time.Now()
-
 	m.save()
 
-	logger.Log.Infof("Approved update for %s: %s",
-		req.ContainerName,
-		req.NewImage,
-	)
+	logger.Log.WithFields(logger.Fields{
+		"container": req.ContainerName,
+		"image":     req.NewImage,
+	}).Info("✅  Update approved")
 
 	return nil
 }
@@ -147,13 +153,12 @@ func (m *Manager) Reject(id string) error {
 
 	req.Status = StatusRejected
 	req.RejectedAt = time.Now()
-
 	m.save()
 
-	logger.Log.Infof("Rejected update for %s: %s",
-		req.ContainerName,
-		req.NewImage,
-	)
+	logger.Log.WithFields(logger.Fields{
+		"container": req.ContainerName,
+		"image":     req.NewImage,
+	}).Info("🚫  Update rejected")
 
 	return nil
 }
@@ -164,13 +169,11 @@ func (m *Manager) IsApproved(containerName string, newImage string) bool {
 	defer m.mu.RUnlock()
 
 	id := buildID(containerName, newImage)
-
 	req, ok := m.requests[id]
 	if !ok {
 		return false
 	}
 
-	// Check expiry
 	if time.Now().After(req.ExpiresAt) {
 		logger.Log.Warnf("Approval expired for %s", containerName)
 		return false
@@ -185,7 +188,6 @@ func (m *Manager) IsPending(containerName string, newImage string) bool {
 	defer m.mu.RUnlock()
 
 	id := buildID(containerName, newImage)
-
 	req, ok := m.requests[id]
 	if !ok {
 		return false
@@ -200,19 +202,15 @@ func (m *Manager) GetPending() []*Request {
 	defer m.mu.RUnlock()
 
 	var pending []*Request
-
 	for _, req := range m.requests {
-		// Skip expired
 		if time.Now().After(req.ExpiresAt) {
 			req.Status = StatusExpired
 			continue
 		}
-
 		if req.Status == StatusPending {
 			pending = append(pending, req)
 		}
 	}
-
 	return pending
 }
 
@@ -225,7 +223,6 @@ func (m *Manager) GetAll() []*Request {
 	for _, req := range m.requests {
 		all = append(all, req)
 	}
-
 	return all
 }
 
@@ -240,49 +237,38 @@ func (m *Manager) CleanExpired() {
 			logger.Log.Debugf("Removed expired approval: %s", id)
 		}
 	}
-
 	m.save()
 }
 
-// save saves requests to file
 func (m *Manager) save() {
 	if m.filePath == "" {
 		return
 	}
-
 	data, err := json.MarshalIndent(m.requests, "", "  ")
 	if err != nil {
 		logger.Log.Errorf("Failed to marshal approvals: %v", err)
 		return
 	}
-
-	err = os.WriteFile(m.filePath, data, 0644)
-	if err != nil {
+	if err := os.WriteFile(m.filePath, data, 0644); err != nil {
 		logger.Log.Errorf("Failed to save approvals: %v", err)
 	}
 }
 
-// load loads requests from file
 func (m *Manager) load() {
 	if m.filePath == "" {
 		return
 	}
-
 	data, err := os.ReadFile(m.filePath)
 	if err != nil {
-		// File does not exist yet
 		return
 	}
-
-	err = json.Unmarshal(data, &m.requests)
-	if err != nil {
+	if err := json.Unmarshal(data, &m.requests); err != nil {
 		logger.Log.Errorf("Failed to load approvals: %v", err)
+		return
 	}
-
 	logger.Log.Infof("Loaded %d approval requests", len(m.requests))
 }
 
-// buildID creates unique ID for a request
 func buildID(containerName string, newImage string) string {
 	return fmt.Sprintf("%s_%s", containerName, newImage)
 }

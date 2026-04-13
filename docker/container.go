@@ -11,16 +11,18 @@ import (
 
 // ContainerInfo holds container details
 type ContainerInfo struct {
-	ID      string
-	Name    string
-	Image   string
-	ImageID string
-	Status  string
-	Running bool
-	Labels  map[string]string // merged: container labels + image labels
+	ID         string
+	Name       string
+	Image      string
+	ImageID    string
+	Status     string
+	State      string
+	Running    bool
+	Restarting bool
+	Labels     map[string]string
 }
 
-// ListContainers returns all running containers
+// ListContainers returns containers based on config flags
 func (c *Client) ListContainers(includeStopped bool) ([]ContainerInfo, error) {
 	ctx := context.Background()
 
@@ -41,18 +43,18 @@ func (c *Client) ListContainers(includeStopped bool) ([]ContainerInfo, error) {
 			name = ct.Names[0][1:]
 		}
 
-		// Merge container labels + image labels
-		// Container labels take priority over image labels
 		mergedLabels := c.mergeLabels(ctx, ct.ID, ct.Labels)
 
 		result = append(result, ContainerInfo{
-			ID:      ct.ID[:12],
-			Name:    name,
-			Image:   ct.Image,
-			ImageID: ct.ImageID,
-			Status:  ct.Status,
-			Running: ct.State == "running",
-			Labels:  mergedLabels,
+			ID:         ct.ID[:12],
+			Name:       name,
+			Image:      ct.Image,
+			ImageID:    ct.ImageID,
+			Status:     ct.Status,
+			State:      ct.State,
+			Running:    ct.State == "running",
+			Restarting: ct.State == "restarting",
+			Labels:     mergedLabels,
 		})
 	}
 
@@ -60,35 +62,76 @@ func (c *Client) ListContainers(includeStopped bool) ([]ContainerInfo, error) {
 	return result, nil
 }
 
-// mergeLabels merges image labels (base) with container labels (override)
-// Container labels always win over image labels
-func (c *Client) mergeLabels(ctx context.Context, containerID string, containerLabels map[string]string) map[string]string {
-	merged := make(map[string]string)
+// ListContainersWithOptions returns containers with full option control
+func (c *Client) ListContainersWithOptions(
+	includeStopped bool,
+	includeRestarting bool,
+) ([]ContainerInfo, error) {
+	ctx := context.Background()
 
-	// First inspect the image to get image-level labels
-	inspect, err := c.CLI.ContainerInspect(ctx, containerID)
+	// Base list - all states if any non-running states needed
+	options := types.ContainerListOptions{
+		All: includeStopped || includeRestarting,
+	}
+
+	containers, err := c.CLI.ContainerList(ctx, options)
 	if err != nil {
-		logger.Log.Debugf("Could not inspect container %s for image labels: %v", containerID[:12], err)
-		// Fall back to container labels only
-		for k, v := range containerLabels {
-			merged[k] = v
+		logger.Log.Errorf("Failed to list containers: %v", err)
+		return nil, err
+	}
+
+	var result []ContainerInfo
+	for _, ct := range containers {
+		// Filter by state
+		switch ct.State {
+		case "running":
+			// always include
+		case "restarting":
+			if !includeRestarting {
+				continue
+			}
+		case "exited", "created", "paused", "dead":
+			if !includeStopped {
+				continue
+			}
 		}
-		return merged
-	}
 
-	// Layer 1: image labels (lowest priority)
-	if inspect.Config != nil {
-		for k, v := range inspect.Config.Labels {
-			merged[k] = v
+		name := "unknown"
+		if len(ct.Names) > 0 {
+			name = ct.Names[0][1:]
 		}
+
+		mergedLabels := c.mergeLabels(ctx, ct.ID, ct.Labels)
+
+		result = append(result, ContainerInfo{
+			ID:         ct.ID[:12],
+			Name:       name,
+			Image:      ct.Image,
+			ImageID:    ct.ImageID,
+			Status:     ct.Status,
+			State:      ct.State,
+			Running:    ct.State == "running",
+			Restarting: ct.State == "restarting",
+			Labels:     mergedLabels,
+		})
 	}
 
-	// Layer 2: container labels (highest priority, overrides image labels)
-	for k, v := range containerLabels {
-		merged[k] = v
+	logger.Log.Debugf("Found %d containers (stopped=%v restarting=%v)",
+		len(result), includeStopped, includeRestarting)
+	return result, nil
+}
+
+// ReviveContainer starts a stopped container
+func (c *Client) ReviveContainer(id string, name string) error {
+	ctx := context.Background()
+
+	if err := c.CLI.ContainerStart(ctx, id, types.ContainerStartOptions{}); err != nil {
+		logger.Log.Errorf("Failed to revive container %s: %v", name, err)
+		return err
 	}
 
-	return merged
+	logger.Log.Infof("♻️   Revived stopped container: %s", name)
+	return nil
 }
 
 // InspectContainer returns detailed info about a container
@@ -137,6 +180,23 @@ func (c *Client) RemoveContainer(id string) error {
 	return nil
 }
 
+// RemoveContainerWithVolumes removes container and its anonymous volumes
+func (c *Client) RemoveContainerWithVolumes(id string) error {
+	ctx := context.Background()
+
+	err := c.CLI.ContainerRemove(ctx, id, types.ContainerRemoveOptions{
+		Force:         true,
+		RemoveVolumes: true,
+	})
+	if err != nil {
+		logger.Log.Errorf("Failed to remove container %s with volumes: %v", id, err)
+		return err
+	}
+
+	logger.Log.Infof("Container and volumes removed: %s", id)
+	return nil
+}
+
 // StartContainer starts a stopped container
 func (c *Client) StartContainer(id string) error {
 	ctx := context.Background()
@@ -178,15 +238,48 @@ func (c *Client) GetContainersByLabel(labelKey string, labelValue string) ([]Con
 		mergedLabels := c.mergeLabels(ctx, ct.ID, ct.Labels)
 
 		result = append(result, ContainerInfo{
-			ID:      ct.ID[:12],
-			Name:    name,
-			Image:   ct.Image,
-			ImageID: ct.ImageID,
-			Status:  ct.Status,
-			Running: ct.State == "running",
-			Labels:  mergedLabels,
+			ID:         ct.ID[:12],
+			Name:       name,
+			Image:      ct.Image,
+			ImageID:    ct.ImageID,
+			Status:     ct.Status,
+			State:      ct.State,
+			Running:    ct.State == "running",
+			Restarting: ct.State == "restarting",
+			Labels:     mergedLabels,
 		})
 	}
 
 	return result, nil
+}
+
+// mergeLabels merges image labels with container labels
+func (c *Client) mergeLabels(
+	ctx context.Context,
+	containerID string,
+	containerLabels map[string]string,
+) map[string]string {
+	merged := make(map[string]string)
+
+	inspect, err := c.CLI.ContainerInspect(ctx, containerID)
+	if err != nil {
+		for k, v := range containerLabels {
+			merged[k] = v
+		}
+		return merged
+	}
+
+	// Layer 1: image labels
+	if inspect.Config != nil {
+		for k, v := range inspect.Config.Labels {
+			merged[k] = v
+		}
+	}
+
+	// Layer 2: container labels override image labels
+	for k, v := range containerLabels {
+		merged[k] = v
+	}
+
+	return merged
 }

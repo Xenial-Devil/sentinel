@@ -13,7 +13,6 @@ import (
 	"syscall"
 )
 
-// Build-time variables - set via ldflags
 var (
 	Version   = "dev"
 	CommitSHA = "none"
@@ -21,16 +20,10 @@ var (
 )
 
 func main() {
-	// Load config
 	cfg := config.Load()
-
-	// Setup logger
 	logger.Init(cfg.LogLevel, cfg.LogFormat)
-
-	// Print banner
 	printBanner()
 
-	// Startup info
 	logger.Log.WithFields(logger.Fields{
 		"os":      runtime.GOOS,
 		"arch":    runtime.GOARCH,
@@ -40,11 +33,17 @@ func main() {
 	}).Info("🛡   Sentinel starting up")
 
 	logger.Log.WithFields(logger.Fields{
-		"host":          cfg.DockerHost,
-		"poll_interval": cfg.PollInterval,
-		"monitor_only":  cfg.MonitorOnly,
-		"watch_all":     cfg.WatchAll,
-		"label_enable":  cfg.LabelEnable,
+		"host":            cfg.DockerHost,
+		"poll_interval":   cfg.PollInterval,
+		"monitor_only":    cfg.MonitorOnly,
+		"watch_all":       cfg.WatchAll,
+		"label_enable":    cfg.LabelEnable,
+		"approval":        cfg.ApprovalEnabled,
+		"rollback":        cfg.EnableRollback,
+		"rolling_restart": cfg.RollingRestart,
+		"scope":           cfg.Scope,
+		"no_pull":         cfg.NoPull,
+		"no_restart":      cfg.NoRestart,
 	}).Info("⚙   Configuration loaded")
 
 	if cfg.LabelEnable {
@@ -61,69 +60,50 @@ func main() {
 	}
 	defer client.Close()
 
-	// Start metrics server
+	// Metrics
+	var m *metrics.Metrics
 	if cfg.MetricsEnabled {
-		m := metrics.New()
+		m = metrics.New()
 		m.StartServer(cfg.MetricsPort)
 		logger.LogMetricsStart(cfg.MetricsPort)
 	}
 
-	// Create watcher
-	w := watcher.New(client, cfg)
+	// Watcher
+	w := watcher.New(client, cfg, m)
 
-	// Start API server
+	// API
 	if cfg.APIEnabled {
 		api.InitApproval(cfg)
-		a := api.New(cfg, w)
+		a := api.New(cfg, w, client) // pass docker client
 		a.Start()
 		defer a.Stop()
 		logger.LogAPIStart(cfg.APIPort, cfg.APIToken != "")
 	}
 
-	// Handle shutdown signals
 	go handleShutdown(client)
-
-	// Start watcher - blocks forever
 	w.Start()
 }
 
-// printBanner prints the sentinel startup banner
 func printBanner() {
 	logger.Log.Info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-	logger.Log.Info("                                                              ")
 	logger.Log.Info("   ███████╗███████╗███╗   ██╗████████╗██╗███╗   ██╗███████╗  ")
 	logger.Log.Info("   ██╔════╝██╔════╝████╗  ██║╚══██╔══╝██║████╗  ██║██╔════╝  ")
 	logger.Log.Info("   ███████╗█████╗  ██╔██╗ ██║   ██║   ██║██╔██╗ ██║█████╗    ")
 	logger.Log.Info("   ╚════██║██╔══╝  ██║╚██╗██║   ██║   ██║██║╚██╗██║██╔══╝    ")
 	logger.Log.Info("   ███████║███████╗██║ ╚████║   ██║   ██║██║ ╚████║███████╗  ")
 	logger.Log.Info("   ╚══════╝╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚═╝╚═╝  ╚═══╝╚══════╝  ")
-	logger.Log.Info("                                                              ")
-	logger.Log.Infof("   🛡   Safe Docker Container Auto-Updater                    ")
-	logger.Log.Infof("   📦  Version    : %s                                       ", Version)
-	logger.Log.Infof("   🔨  Commit     : %s                                       ", CommitSHA)
-	logger.Log.Infof("   📅  Build Date : %s                                       ", BuildDate)
-	logger.Log.Infof("   🖥   Runtime    : Go %s %s/%s                             ", runtime.Version(), runtime.GOOS, runtime.GOARCH)
-	logger.Log.Info("                                                              ")
+	logger.Log.Infof("   🛡   Sentinel  v%s  (%s)  built %s", Version, CommitSHA, BuildDate)
+	logger.Log.Infof("   🖥   Runtime   Go %s  %s/%s", runtime.Version(), runtime.GOOS, runtime.GOARCH)
 	logger.Log.Info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 }
 
-// handleShutdown listens for OS signals and gracefully shuts down
 func handleShutdown(client *docker.Client) {
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan,
-		syscall.SIGINT,
-		syscall.SIGTERM,
-	)
-
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigChan
-
-	logger.Log.WithField("signal", sig.String()).
-		Warn("⚠   Shutdown signal received")
-
+	logger.Log.WithField("signal", sig.String()).Warn("⚠   Shutdown signal received")
 	logger.LogShutdown(sig.String())
-
 	client.Close()
-
 	logger.Log.Info("👋  Sentinel stopped. Goodbye.")
 	os.Exit(0)
 }

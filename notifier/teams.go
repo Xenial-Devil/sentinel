@@ -15,19 +15,28 @@ type TeamsNotifier struct {
 	HTTPClient *http.Client
 }
 
-// TeamsMessage is the Teams webhook payload
+// TeamsMessage is the Teams adaptive card payload
 type TeamsMessage struct {
-	Type       string    `json:"@type"`
-	Context    string    `json:"@context"`
-	ThemeColor string    `json:"themeColor"`
-	Summary    string    `json:"summary"`
-	Sections   []Section `json:"sections"`
+	Type       string         `json:"@type"`
+	Context    string         `json:"@context"`
+	ThemeColor string         `json:"themeColor"`
+	Summary    string         `json:"summary"`
+	Sections   []TeamsSection `json:"sections"`
 }
 
-// Section is a Teams message section
-type Section struct {
-	ActivityTitle string `json:"activityTitle"`
-	ActivityText  string `json:"activityText"`
+// TeamsSection is a Teams message section
+type TeamsSection struct {
+	ActivityTitle    string      `json:"activityTitle"`
+	ActivitySubtitle string      `json:"activitySubtitle"`
+	ActivityText     string      `json:"activityText,omitempty"`
+	Facts            []TeamsFact `json:"facts,omitempty"`
+	Markdown         bool        `json:"markdown"`
+}
+
+// TeamsFact is a key-value fact in Teams
+type TeamsFact struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
 // NewTeams creates a new TeamsNotifier
@@ -42,18 +51,7 @@ func NewTeams(webhookURL string) *TeamsNotifier {
 
 // Send sends a notification to Teams
 func (t *TeamsNotifier) Send(n Notification, message string) error {
-	msg := TeamsMessage{
-		Type:       "MessageCard",
-		Context:    "http://schema.org/extensions",
-		ThemeColor: getTeamsColor(n.Event),
-		Summary:    "Sentinel Notification",
-		Sections: []Section{
-			{
-				ActivityTitle: fmt.Sprintf("Sentinel 🛡️ - %s", n.Event),
-				ActivityText:  message,
-			},
-		},
-	}
+	msg := buildTeamsMessage(n, message)
 
 	payload, err := json.Marshal(msg)
 	if err != nil {
@@ -80,6 +78,48 @@ func (t *TeamsNotifier) Send(n Notification, message string) error {
 
 	logger.Log.Debug("Teams notification sent")
 	return nil
+}
+
+// buildTeamsMessage builds a rich Teams message card
+func buildTeamsMessage(n Notification, message string) TeamsMessage {
+	icon := eventIcon(n.Event)
+
+	// Build facts
+	facts := []TeamsFact{
+		{Name: "Event", Value: string(n.Event)},
+		{Name: "Time", Value: formatTime(n.Timestamp)},
+	}
+
+	if n.ContainerName != "" {
+		facts = append(facts, TeamsFact{Name: "Container", Value: n.ContainerName})
+	}
+	if n.Image != "" {
+		facts = append(facts, TeamsFact{Name: "Image", Value: n.Image})
+	}
+	if n.OldImage != "" {
+		facts = append(facts, TeamsFact{Name: "Old Image", Value: n.OldImage})
+	}
+	if n.NewImage != "" {
+		facts = append(facts, TeamsFact{Name: "New Image", Value: n.NewImage})
+	}
+	if n.Error != "" {
+		facts = append(facts, TeamsFact{Name: "Error", Value: n.Error})
+	}
+
+	return TeamsMessage{
+		Type:       "MessageCard",
+		Context:    "http://schema.org/extensions",
+		ThemeColor: getTeamsColor(n.Event),
+		Summary:    fmt.Sprintf("Sentinel: %s - %s", n.Event, n.ContainerName),
+		Sections: []TeamsSection{
+			{
+				ActivityTitle:    fmt.Sprintf("%s Sentinel Alert", icon),
+				ActivitySubtitle: message,
+				Facts:            facts,
+				Markdown:         true,
+			},
+		},
+	}
 }
 
 // getTeamsColor returns color based on event type

@@ -1,22 +1,21 @@
 package notifier
 
 import (
-	"fmt"
 	"sentinel/config"
 	"sentinel/logger"
 	"time"
 )
 
-// Event types for notifications
+// EventType defines notification event types
 type EventType string
 
 const (
-	EventUpdateFound    EventType = "update_found"
-	EventUpdateSuccess  EventType = "update_success"
-	EventUpdateFailed   EventType = "update_failed"
-	EventRollback       EventType = "rollback"
-	EventHealthFailed   EventType = "health_failed"
-	EventStartup        EventType = "startup"
+	EventUpdateFound   EventType = "update_found"
+	EventUpdateSuccess EventType = "update_success"
+	EventUpdateFailed  EventType = "update_failed"
+	EventRollback      EventType = "rollback"
+	EventHealthFailed  EventType = "health_failed"
+	EventStartup       EventType = "startup"
 )
 
 // Notification holds all notification data
@@ -36,121 +35,82 @@ type Notifier struct {
 	Slack    *SlackNotifier
 	Email    *EmailNotifier
 	Teams    *TeamsNotifier
+	Template *TemplateEngine
 }
 
-// New creates a new Notifier
+// New creates a new Notifier with all configured channels
 func New(cfg *config.Config) *Notifier {
 	n := &Notifier{
-		Config: cfg,
+		Config:   cfg,
+		Template: NewTemplateEngine(),
 	}
 
-	// Setup slack if configured
+	// Override templates from env if configured
+	loadTemplatesFromConfig(n.Template, cfg)
+
 	if cfg.SlackWebhook != "" {
 		n.Slack = NewSlack(cfg.SlackWebhook)
-		logger.Log.Info("Slack notifications enabled")
+		logger.Log.WithField("channel", "slack").Info("📣  Slack notifications enabled")
 	}
 
-	// Setup email if configured
 	if cfg.EmailTo != "" {
 		n.Email = NewEmail(cfg)
-		logger.Log.Info("Email notifications enabled")
+		logger.Log.WithField("channel", "email").Info("📣  Email notifications enabled")
+	}
+
+	if cfg.TeamsWebhook != "" {
+		n.Teams = NewTeams(cfg.TeamsWebhook)
+		logger.Log.WithField("channel", "teams").Info("📣  Teams notifications enabled")
 	}
 
 	return n
 }
 
-// Send sends notification to all configured channels
+// Send sends notification to all configured channels using templates
 func (n *Notifier) Send(notification Notification) {
-	// Set timestamp if not set
 	if notification.Timestamp.IsZero() {
 		notification.Timestamp = time.Now()
 	}
 
-	// Format message
-	message := n.formatMessage(notification)
+	// Render message using template engine
+	message := n.Template.Render(notification)
 
-	logger.Log.Debugf("Sending notification: %s", message)
+	logger.Log.WithFields(logger.Fields{
+		"event":     notification.Event,
+		"container": notification.ContainerName,
+	}).Debugf("Sending notification via all channels")
 
-	// Send to slack
 	if n.Slack != nil {
-		err := n.Slack.Send(notification, message)
-		if err != nil {
-			logger.Log.Errorf("Failed to send Slack notification: %v", err)
+		if err := n.Slack.Send(notification, message); err != nil {
+			logger.Log.WithError(err).Error("Failed to send Slack notification")
 		}
 	}
 
-	// Send to email
 	if n.Email != nil {
-		err := n.Email.Send(notification, message)
-		if err != nil {
-			logger.Log.Errorf("Failed to send Email notification: %v", err)
+		if err := n.Email.Send(notification, message); err != nil {
+			logger.Log.WithError(err).Error("Failed to send Email notification")
 		}
 	}
 
-	// Send to teams
 	if n.Teams != nil {
-		err := n.Teams.Send(notification, message)
-		if err != nil {
-			logger.Log.Errorf("Failed to send Teams notification: %v", err)
+		if err := n.Teams.Send(notification, message); err != nil {
+			logger.Log.WithError(err).Error("Failed to send Teams notification")
 		}
 	}
 }
 
-// formatMessage formats notification into readable message
-func (n *Notifier) formatMessage(notification Notification) string {
-	switch notification.Event {
-
-	case EventUpdateFound:
-		return fmt.Sprintf(
-			"🔍 Update found for %s\nImage: %s",
-			notification.ContainerName,
-			notification.Image,
-		)
-
-	case EventUpdateSuccess:
-		return fmt.Sprintf(
-			"✅ Successfully updated %s\nImage: %s",
-			notification.ContainerName,
-			notification.NewImage,
-		)
-
-	case EventUpdateFailed:
-		return fmt.Sprintf(
-			"❌ Failed to update %s\nImage: %s\nError: %s",
-			notification.ContainerName,
-			notification.Image,
-			notification.Error,
-		)
-
-	case EventRollback:
-		return fmt.Sprintf(
-			"⚠️ Rolled back %s\nFrom: %s\nTo: %s",
-			notification.ContainerName,
-			notification.NewImage,
-			notification.OldImage,
-		)
-
-	case EventHealthFailed:
-		return fmt.Sprintf(
-			"🚨 Health check failed for %s\nImage: %s",
-			notification.ContainerName,
-			notification.Image,
-		)
-
-	case EventStartup:
-		return "🛡️ Sentinel started\nWatching containers..."
-
-	default:
-		return fmt.Sprintf(
-			"📢 Sentinel event: %s\nContainer: %s",
-			notification.Event,
-			notification.ContainerName,
-		)
+// loadTemplatesFromConfig loads custom templates from config env vars
+func loadTemplatesFromConfig(t *TemplateEngine, cfg *config.Config) {
+	// Custom templates can be set via NotifyTemplates map in config
+	for event, tmpl := range cfg.NotifyTemplates {
+		t.SetTemplate(EventType(event), tmpl)
+		logger.Log.WithField("event", event).Debug("📝  Custom notification template loaded")
 	}
 }
 
-// NotifyUpdate sends update found notification
-func (n *Notifier) NotifyUpdate(containerName string, image string) {
+// ── Convenience helpers ───────────────────────────────────────────────────────
+
+func (n *Notifier) NotifyUpdateFound(containerName string, image string) {
 	n.Send(Notification{
 		Event:         EventUpdateFound,
 		ContainerName: containerName,
@@ -158,16 +118,15 @@ func (n *Notifier) NotifyUpdate(containerName string, image string) {
 	})
 }
 
-// NotifySuccess sends update success notification
-func (n *Notifier) NotifySuccess(containerName string, newImage string) {
+func (n *Notifier) NotifySuccess(containerName string, oldImage string, newImage string) {
 	n.Send(Notification{
 		Event:         EventUpdateSuccess,
 		ContainerName: containerName,
+		OldImage:      oldImage,
 		NewImage:      newImage,
 	})
 }
 
-// NotifyFailed sends update failed notification
 func (n *Notifier) NotifyFailed(containerName string, image string, err error) {
 	n.Send(Notification{
 		Event:         EventUpdateFailed,
@@ -177,7 +136,6 @@ func (n *Notifier) NotifyFailed(containerName string, image string, err error) {
 	})
 }
 
-// NotifyRollback sends rollback notification
 func (n *Notifier) NotifyRollback(containerName string, oldImage string, newImage string) {
 	n.Send(Notification{
 		Event:         EventRollback,
@@ -187,7 +145,14 @@ func (n *Notifier) NotifyRollback(containerName string, oldImage string, newImag
 	})
 }
 
-// NotifyStartup sends startup notification
+func (n *Notifier) NotifyHealthFailed(containerName string, image string) {
+	n.Send(Notification{
+		Event:         EventHealthFailed,
+		ContainerName: containerName,
+		Image:         image,
+	})
+}
+
 func (n *Notifier) NotifyStartup() {
 	n.Send(Notification{
 		Event: EventStartup,

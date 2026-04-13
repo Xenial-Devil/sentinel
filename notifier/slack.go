@@ -17,16 +17,21 @@ type SlackNotifier struct {
 
 // SlackMessage is the Slack webhook payload
 type SlackMessage struct {
-	Text        string       `json:"text"`
-	Attachments []Attachment `json:"attachments,omitempty"`
+	Blocks []SlackBlock `json:"blocks,omitempty"`
+	Text   string       `json:"text"` // fallback for notifications
 }
 
-// Attachment is a Slack message attachment
-type Attachment struct {
-	Color  string `json:"color"`
-	Text   string `json:"text"`
-	Footer string `json:"footer"`
-	Ts     int64  `json:"ts"`
+// SlackBlock is a Slack block kit block
+type SlackBlock struct {
+	Type string       `json:"type"`
+	Text *SlackText   `json:"text,omitempty"`
+	Fields []SlackText `json:"fields,omitempty"`
+}
+
+// SlackText is a Slack text object
+type SlackText struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
 // NewSlack creates a new SlackNotifier
@@ -39,18 +44,9 @@ func NewSlack(webhookURL string) *SlackNotifier {
 	}
 }
 
-// Send sends a notification to Slack
+// Send sends a notification to Slack using block kit
 func (s *SlackNotifier) Send(n Notification, message string) error {
-	msg := SlackMessage{
-		Attachments: []Attachment{
-			{
-				Color:  getSlackColor(n.Event),
-				Text:   message,
-				Footer: "Sentinel 🛡️",
-				Ts:     time.Now().Unix(),
-			},
-		},
-	}
+	msg := buildSlackMessage(n, message)
 
 	payload, err := json.Marshal(msg)
 	if err != nil {
@@ -77,6 +73,76 @@ func (s *SlackNotifier) Send(n Notification, message string) error {
 
 	logger.Log.Debug("Slack notification sent")
 	return nil
+}
+
+// buildSlackMessage builds a rich Slack block kit message
+func buildSlackMessage(n Notification, message string) SlackMessage {
+	icon := eventIcon(n.Event)
+	color := getSlackColor(n.Event)
+	_ = color // used in attachment mode if needed
+
+	blocks := []SlackBlock{
+		// Header
+		{
+			Type: "header",
+			Text: &SlackText{
+				Type: "plain_text",
+				Text: fmt.Sprintf("%s Sentinel Alert", icon),
+			},
+		},
+		// Main message
+		{
+			Type: "section",
+			Text: &SlackText{
+				Type: "mrkdwn",
+				Text: message,
+			},
+		},
+	}
+
+	// Add fields if container info present
+	if n.ContainerName != "" {
+		fields := []SlackText{
+			{Type: "mrkdwn", Text: fmt.Sprintf("*Event*\n%s", n.Event)},
+			{Type: "mrkdwn", Text: fmt.Sprintf("*Container*\n%s", n.ContainerName)},
+		}
+
+		if n.Image != "" {
+			fields = append(fields, SlackText{
+				Type: "mrkdwn",
+				Text: fmt.Sprintf("*Image*\n%s", n.Image),
+			})
+		}
+
+		if n.Error != "" {
+			fields = append(fields, SlackText{
+				Type: "mrkdwn",
+				Text: fmt.Sprintf("*Error*\n%s", n.Error),
+			})
+		}
+
+		blocks = append(blocks, SlackBlock{
+			Type:   "section",
+			Fields: fields,
+		})
+	}
+
+	// Divider
+	blocks = append(blocks, SlackBlock{Type: "divider"})
+
+	// Context footer
+	blocks = append(blocks, SlackBlock{
+		Type: "context",
+		Text: &SlackText{
+			Type: "mrkdwn",
+			Text: fmt.Sprintf("Sentinel 🛡️  |  %s", formatTime(n.Timestamp)),
+		},
+	})
+
+	return SlackMessage{
+		Text:   fmt.Sprintf("%s %s - %s", icon, n.Event, n.ContainerName),
+		Blocks: blocks,
+	}
 }
 
 // getSlackColor returns color based on event type

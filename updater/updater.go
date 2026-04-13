@@ -10,8 +10,10 @@ import (
 	"sentinel/logger"
 	"sentinel/registry"
 	"strings"
+	"time"
 
 	dockertypes "github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 )
 
@@ -19,8 +21,12 @@ import (
 type UpdateResult struct {
 	ContainerName string
 	Image         string
+	OldImage      string
+	NewImage      string
 	Updated       bool
 	RolledBack    bool
+	NoPull        bool
+	NoRestart     bool
 	Error         error
 }
 
@@ -41,20 +47,48 @@ func New(client *docker.Client, cfg *config.Config) *Updater {
 }
 
 // CheckAndUpdate checks a container for updates and applies if available
-func (u *Updater) CheckAndUpdate(ct docker.ContainerInfo) UpdateResult {
+func (u *Updater) CheckAndUpdate(
+	ct docker.ContainerInfo,
+	noPull bool,
+	noRestart bool,
+	rollingRestart bool,
+) UpdateResult {
 	result := UpdateResult{
 		ContainerName: ct.Name,
 		Image:         ct.Image,
+		OldImage:      ct.Image,
+		NoPull:        noPull,
+		NoRestart:     noRestart,
 	}
 
-	localDigest, err := u.getLocalDigest(ct.ImageID)
+	logger.LogImageCheckStart(ct.Name, ct.Image)
+
+	// ── No-pull mode ──────────────────────────────────────────────────────────
+	if noPull {
+		logger.Log.Infof("👁   [NO-PULL] %s - skipping registry check", ct.Name)
+
+		if noRestart {
+			logger.Log.Infof("👁   [NO-RESTART] %s - no action taken", ct.Name)
+			return result
+		}
+
+		if rollingRestart || u.Config.RollingRestart {
+			return u.applyRollingRestart(ct, result)
+		}
+
+		return u.applyRestartOnly(ct, result)
+	}
+
+	// ── Get local digest ──────────────────────────────────────────────────────
+	localDigest, err := u.GetLocalDigest(ct.ImageID)
 	if err != nil {
 		logger.Log.Errorf("Failed to get local digest for %s: %v", ct.Name, err)
 		result.Error = err
 		return result
 	}
 
-	hasUpdate, newTag, err := u.Registry.HasUpdate(localDigest, ct.Image)
+	// ── Check registry ────────────────────────────────────────────────────────
+	hasUpdate, _, err := u.Registry.HasUpdate(localDigest, ct.Image)
 	if err != nil {
 		logger.Log.Warnf("Failed to check registry for %s: %v", ct.Name, err)
 		result.Error = err
@@ -62,67 +96,224 @@ func (u *Updater) CheckAndUpdate(ct docker.ContainerInfo) UpdateResult {
 	}
 
 	if !hasUpdate {
-		logger.Log.Infof("No update for %s", ct.Name)
+		currentTag := GetTagFromImage(ct.Image)
+		logger.LogImageUpToDate(ct.Name, ct.Image, currentTag)
 		return result
 	}
 
+	// ── Semver policy check ───────────────────────────────────────────────────
 	currentTag := GetTagFromImage(ct.Image)
+	newTag := currentTag
+
 	policy := Policy(u.Config.SemverPolicy)
-	allowed, err := CheckVersionPolicy(currentTag, newTag, policy)
-	if err != nil {
-		logger.Log.Warnf("Version policy check failed for %s: %v", ct.Name, err)
+	if policy != PolicyAll {
+		allowed, err := CheckVersionPolicy(currentTag, newTag, policy)
+		if err != nil {
+			logger.Log.Warnf("Version policy check failed for %s: %v", ct.Name, err)
+		}
+		if !allowed {
+			logger.Log.Infof("Update blocked by semver policy (%s) for %s", policy, ct.Name)
+			return result
+		}
 	}
-	if !allowed {
-		logger.Log.Infof("Update blocked by policy (%s) for %s: %s -> %s",
-			policy, ct.Name, currentTag, newTag)
+
+	logger.LogImageUpdateFound(ct.Name, ct.Image, currentTag, newTag)
+
+	// ── No-restart: pull only ─────────────────────────────────────────────────
+	if noRestart || u.Config.NoRestart {
+		logger.Log.Infof("📥  [NO-RESTART] %s pulling image but not restarting", ct.Name)
+		if err := u.pullImage(ct.Image); err != nil {
+			logger.LogImagePullFailed(ct.Name, ct.Image, err)
+			result.Error = err
+			return result
+		}
+		logger.Log.Infof("📦  [NO-RESTART] %s image pulled - container not restarted", ct.Name)
+		result.Updated = true
+		result.NewImage = ct.Image
 		return result
 	}
 
-	logger.Log.Infof("Update found for %s (%s -> %s) - applying...", ct.Name, currentTag, newTag)
-	err = u.applyUpdate(ct)
-	if err != nil {
+	// ── Rolling restart ───────────────────────────────────────────────────────
+	if rollingRestart || u.Config.RollingRestart {
+		return u.applyRollingRestart(ct, result)
+	}
+
+	// ── Standard update ───────────────────────────────────────────────────────
+	start := time.Now()
+	if err := u.applyUpdate(ct, &result); err != nil {
 		logger.Log.Errorf("Failed to update %s: %v", ct.Name, err)
 		result.Error = err
 		return result
 	}
 
 	result.Updated = true
-	logger.Log.Infof("Successfully updated %s", ct.Name)
+	result.NewImage = ct.Image
+	logger.LogUpdateSuccess(ct.Name, ct.Image, ct.Image, time.Since(start))
+
 	return result
 }
 
-// applyUpdate pulls new image and recreates container
-func (u *Updater) applyUpdate(ct docker.ContainerInfo) error {
+// applyUpdate pulls new image, stops old container, recreates with health check
+func (u *Updater) applyUpdate(ct docker.ContainerInfo, result *UpdateResult) error {
 	info, err := u.Client.InspectContainer(ct.ID)
 	if err != nil {
 		return fmt.Errorf("failed to inspect container: %v", err)
 	}
 
-	logger.Log.Infof("Pulling new image: %s", ct.Image)
-	err = u.pullImage(ct.Image)
-	if err != nil {
+	rollbackState := u.SaveState(info)
+
+	// Pull
+	logger.LogImagePullStart(ct.Name, ct.Image)
+	pullStart := time.Now()
+	if err := u.pullImage(ct.Image); err != nil {
+		logger.LogImagePullFailed(ct.Name, ct.Image, err)
 		return fmt.Errorf("failed to pull image: %v", err)
 	}
+	logger.LogImagePullSuccess(ct.Name, ct.Image, time.Since(pullStart))
 
-	logger.Log.Infof("Stopping container: %s", ct.Name)
-	err = u.Client.StopContainer(ct.ID, u.Config.StopTimeout)
-	if err != nil {
+	// Stop
+	stopStart := time.Now()
+	logger.LogContainerStopping(ct.Name, ct.ID, u.Config.StopTimeout)
+	if err := u.Client.StopContainer(ct.ID, u.Config.StopTimeout); err != nil {
 		return fmt.Errorf("failed to stop container: %v", err)
 	}
+	logger.LogContainerStopped(ct.Name, ct.ID, time.Since(stopStart))
 
-	logger.Log.Infof("Removing old container: %s", ct.Name)
-	err = u.Client.RemoveContainer(ct.ID)
-	if err != nil {
+	// Remove
+	logger.LogContainerRemoving(ct.Name, ct.ID)
+	if err := u.Client.RemoveContainer(ct.ID); err != nil {
 		return fmt.Errorf("failed to remove container: %v", err)
 	}
+	logger.LogContainerRemoved(ct.Name, ct.ID)
 
-	logger.Log.Infof("Recreating container: %s", ct.Name)
-	err = u.recreateContainer(ct.Name, info)
-	if err != nil {
+	// Recreate
+	logger.LogContainerStarting(ct.Name, ct.ID)
+	startTime := time.Now()
+	if err := u.recreateContainer(ct.Name, info); err != nil {
+		logger.Log.Errorf("Recreate failed for %s - attempting rollback", ct.Name)
+		if u.Config.EnableRollback {
+			if rbErr := u.Rollback(rollbackState); rbErr != nil {
+				logger.LogRollbackFailed(ct.Name, ct.Image, rbErr)
+				return fmt.Errorf("recreate and rollback both failed: %v / %v", err, rbErr)
+			}
+			result.RolledBack = true
+			result.NewImage = rollbackState.OldImage
+			logger.LogRollbackSuccess(ct.Name, rollbackState.OldImage)
+		}
 		return fmt.Errorf("failed to recreate container: %v", err)
+	}
+	logger.LogContainerStarted(ct.Name, ct.ID, time.Since(startTime))
+
+	// Health check + rollback
+	if u.Config.EnableRollback {
+		if err := u.WaitForHealthy(ct.Name); err != nil {
+			logger.LogHealthTimeout(ct.Name, u.Config.HealthTimeout)
+			logger.LogRollbackStart(ct.Name, ct.Image, rollbackState.OldImage)
+
+			if rbErr := u.Rollback(rollbackState); rbErr != nil {
+				logger.LogRollbackFailed(ct.Name, ct.Image, rbErr)
+				return fmt.Errorf("health failed and rollback failed: %v / %v", err, rbErr)
+			}
+
+			result.RolledBack = true
+			result.NewImage = rollbackState.OldImage
+			logger.LogRollbackSuccess(ct.Name, rollbackState.OldImage)
+			return fmt.Errorf("container unhealthy after update - rolled back")
+		}
+		logger.LogHealthCheck(ct.Name, true, time.Duration(u.Config.HealthTimeout)*time.Second)
 	}
 
 	return nil
+}
+
+// applyRollingRestart stops and restarts container with optional image pull
+func (u *Updater) applyRollingRestart(ct docker.ContainerInfo, result UpdateResult) UpdateResult {
+	logger.Log.Infof("🔄  [ROLLING-RESTART] Starting rolling restart for %s", ct.Name)
+
+	info, err := u.Client.InspectContainer(ct.ID)
+	if err != nil {
+		result.Error = fmt.Errorf("failed to inspect container: %v", err)
+		return result
+	}
+
+	rollbackState := u.SaveState(info)
+
+	if !result.NoPull {
+		logger.LogImagePullStart(ct.Name, ct.Image)
+		pullStart := time.Now()
+		if err := u.pullImage(ct.Image); err != nil {
+			logger.LogImagePullFailed(ct.Name, ct.Image, err)
+			result.Error = err
+			return result
+		}
+		logger.LogImagePullSuccess(ct.Name, ct.Image, time.Since(pullStart))
+	}
+
+	logger.LogContainerStopping(ct.Name, ct.ID, u.Config.StopTimeout)
+	if err := u.Client.StopContainer(ct.ID, u.Config.StopTimeout); err != nil {
+		result.Error = fmt.Errorf("rolling restart stop failed: %v", err)
+		return result
+	}
+
+	time.Sleep(2 * time.Second)
+
+	if err := u.Client.RemoveContainer(ct.ID); err != nil {
+		result.Error = fmt.Errorf("rolling restart remove failed: %v", err)
+		return result
+	}
+
+	if err := u.recreateContainer(ct.Name, info); err != nil {
+		if u.Config.EnableRollback {
+			if rbErr := u.Rollback(rollbackState); rbErr != nil {
+				logger.LogRollbackFailed(ct.Name, ct.Image, rbErr)
+			} else {
+				result.RolledBack = true
+				result.NewImage = rollbackState.OldImage
+				logger.LogRollbackSuccess(ct.Name, rollbackState.OldImage)
+			}
+		}
+		result.Error = fmt.Errorf("rolling restart recreate failed: %v", err)
+		return result
+	}
+
+	if u.Config.EnableRollback {
+		if err := u.WaitForHealthy(ct.Name); err != nil {
+			logger.LogRollbackStart(ct.Name, ct.Image, rollbackState.OldImage)
+			if rbErr := u.Rollback(rollbackState); rbErr != nil {
+				logger.LogRollbackFailed(ct.Name, ct.Image, rbErr)
+			} else {
+				result.RolledBack = true
+				result.NewImage = rollbackState.OldImage
+				logger.LogRollbackSuccess(ct.Name, rollbackState.OldImage)
+			}
+			result.Error = err
+			return result
+		}
+	}
+
+	logger.Log.Infof("✅  [ROLLING-RESTART] %s restarted successfully", ct.Name)
+	result.Updated = true
+	result.NewImage = ct.Image
+	return result
+}
+
+// applyRestartOnly restarts container without pulling new image
+func (u *Updater) applyRestartOnly(ct docker.ContainerInfo, result UpdateResult) UpdateResult {
+	logger.Log.Infof("🔄  [RESTART-ONLY] Restarting %s without pull", ct.Name)
+
+	ctx := context.Background()
+	timeout := u.Config.StopTimeout
+
+	if err := u.Client.CLI.ContainerRestart(ctx, ct.ID, container.StopOptions{
+		Timeout: &timeout,
+	}); err != nil {
+		result.Error = fmt.Errorf("restart failed: %v", err)
+		return result
+	}
+
+	logger.Log.Infof("✅  [RESTART-ONLY] %s restarted", ct.Name)
+	result.Updated = true
+	return result
 }
 
 // pullImage pulls a new image from registry
@@ -152,7 +343,6 @@ func (u *Updater) pullImage(image string) error {
 			}
 			return err
 		}
-
 		if status, ok := event["status"].(string); ok {
 			if id, ok := event["id"].(string); ok {
 				logger.Log.Debugf("Pull: %s - %s", id, status)
@@ -160,7 +350,6 @@ func (u *Updater) pullImage(image string) error {
 		}
 	}
 
-	logger.Log.Infof("Image pulled successfully: %s", image)
 	return nil
 }
 
@@ -168,17 +357,14 @@ func (u *Updater) pullImage(image string) error {
 func (u *Updater) recreateContainer(name string, info dockertypes.ContainerJSON) error {
 	ctx := context.Background()
 
-	containerConfig := info.Config
-	hostConfig := info.HostConfig
-
 	networkConfig := &network.NetworkingConfig{
 		EndpointsConfig: info.NetworkSettings.Networks,
 	}
 
 	resp, err := u.Client.CLI.ContainerCreate(
 		ctx,
-		containerConfig,
-		hostConfig,
+		info.Config,
+		info.HostConfig,
 		networkConfig,
 		nil,
 		name,
@@ -187,21 +373,19 @@ func (u *Updater) recreateContainer(name string, info dockertypes.ContainerJSON)
 		return fmt.Errorf("failed to create container: %v", err)
 	}
 
-	err = u.Client.CLI.ContainerStart(
+	if err := u.Client.CLI.ContainerStart(
 		ctx,
 		resp.ID,
 		dockertypes.ContainerStartOptions{},
-	)
-	if err != nil {
+	); err != nil {
 		return fmt.Errorf("failed to start container: %v", err)
 	}
 
-	logger.Log.Infof("Container recreated and started: %s", name)
 	return nil
 }
 
-// getLocalDigest gets the digest of a local image
-func (u *Updater) getLocalDigest(imageID string) (string, error) {
+// GetLocalDigest gets the digest of a local image - exported for watcher approval flow
+func (u *Updater) GetLocalDigest(imageID string) (string, error) {
 	ctx := context.Background()
 
 	inspect, _, err := u.Client.CLI.ImageInspectWithRaw(ctx, imageID)
@@ -231,14 +415,12 @@ func (u *Updater) CleanupOldImage(imageID string) {
 	_, err := u.Client.CLI.ImageRemove(
 		ctx,
 		imageID,
-		dockertypes.ImageRemoveOptions{
-			Force: false,
-		},
+		dockertypes.ImageRemoveOptions{Force: false},
 	)
 	if err != nil {
 		logger.Log.Warnf("Failed to cleanup old image %s: %v", imageID, err)
 		return
 	}
 
-	logger.Log.Infof("Old image removed: %s", imageID)
+	logger.LogCleanup(imageID, 0)
 }
