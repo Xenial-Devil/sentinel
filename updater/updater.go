@@ -316,14 +316,20 @@ func (u *Updater) applyRestartOnly(ct docker.ContainerInfo, result UpdateResult)
 	return result
 }
 
-// pullImage pulls a new image from registry
+// pullImage pulls a new image from registry, using credentials for private registries.
 func (u *Updater) pullImage(image string) error {
 	ctx := context.Background()
+
+	// Resolve auth header for the image's registry (empty string for public images)
+	ref := registry.ParseImageRef(image)
+	authHeader := registry.GetAuthHeader(ref.Registry)
 
 	reader, err := u.Client.CLI.ImagePull(
 		ctx,
 		image,
-		dockertypes.ImagePullOptions{},
+		dockertypes.ImagePullOptions{
+			RegistryAuth: authHeader,
+		},
 	)
 	if err != nil {
 		return err

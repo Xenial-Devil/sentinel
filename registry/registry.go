@@ -5,9 +5,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sentinel/logger"
 	"strings"
 	"time"
+)
+
+// dockerHubTokenURL and dockerHubManifestBase are overridable in tests.
+var (
+	dockerHubTokenURL    = "https://auth.docker.io/token"
+	dockerHubManifestBase = "https://registry-1.docker.io/v2"
 )
 
 // ImageRef holds parsed image reference parts
@@ -110,15 +117,15 @@ func (c *Client) getDockerHubDigest(ref ImageRef) (string, error) {
 		return "", fmt.Errorf("failed to get docker hub token: %v", err)
 	}
 
-	url := fmt.Sprintf(
-		"https://registry-1.docker.io/v2/%s/manifests/%s",
-		ref.Name, ref.Tag,
-	)
+	manifestURL := fmt.Sprintf("%s/%s/manifests/%s",
+		dockerHubManifestBase, ref.Name, ref.Tag)
 
-	return c.fetchDigest(url, token)
+	return c.fetchDigest(manifestURL, token)
 }
 
-// getPrivateDigest gets digest from a private registry
+// getPrivateDigest gets digest from a private registry.
+// It first tries anonymous access; on 401 it attempts to authenticate
+// using credentials from env vars or ~/.docker/config.json.
 func (c *Client) getPrivateDigest(ref ImageRef) (string, error) {
 	scheme := "https"
 	// Use http for localhost or plain IP with port
@@ -126,35 +133,175 @@ func (c *Client) getPrivateDigest(ref ImageRef) (string, error) {
 		scheme = "http"
 	}
 
-	url := fmt.Sprintf(
+	manifestURL := fmt.Sprintf(
 		"%s://%s/v2/%s/manifests/%s",
 		scheme, ref.Registry, ref.Name, ref.Tag,
 	)
 
-	// Try without auth first
-	digest, err := c.fetchDigest(url, "")
-	if err != nil {
-		logger.Log.Debugf("Private registry unauthenticated fetch failed: %v", err)
+	// 1. Try anonymous first
+	digest, err := c.fetchDigest(manifestURL, "")
+	if err == nil {
+		return digest, nil
+	}
+
+	logger.Log.Debugf("Anonymous fetch failed for %s: %v — trying authenticated", ref.Registry, err)
+
+	// 2. Load credentials for this registry
+	creds, credsErr := GetCredentials(ref.Registry)
+	if credsErr != nil {
+		logger.Log.Debugf("Failed to load credentials for %s: %v", ref.Registry, credsErr)
+	}
+
+	if creds == nil {
 		return "", fmt.Errorf("private registry auth not configured for %s", ref.Registry)
+	}
+
+	// 3. Try Basic auth
+	basicHeader := GetBasicAuthHeader(ref.Registry)
+	digest, err = c.fetchDigest(manifestURL, basicHeader)
+	if err == nil {
+		return digest, nil
+	}
+
+	// 4. Try Bearer token via WWW-Authenticate challenge (e.g. ghcr.io)
+	token, tokenErr := c.getBearerToken(ref, scheme, creds)
+	if tokenErr != nil {
+		logger.Log.Debugf("Bearer token fetch failed for %s: %v", ref.Registry, tokenErr)
+		return "", fmt.Errorf("authentication failed for %s: %v", ref.Registry, err)
+	}
+
+	digest, err = c.fetchDigest(manifestURL, "Bearer "+token)
+	if err != nil {
+		return "", fmt.Errorf("authenticated fetch failed for %s: %v", ref.Registry, err)
 	}
 
 	return digest, nil
 }
 
-// fetchDigest performs HEAD request and extracts Docker-Content-Digest header
-func (c *Client) fetchDigest(url string, token string) (string, error) {
+// getBearerToken obtains a Bearer token from the registry's auth service.
+// It does a HEAD request without auth, reads the WWW-Authenticate header,
+// then fetches a token from the provided realm with the given credentials.
+func (c *Client) getBearerToken(ref ImageRef, scheme string, creds *Credentials) (string, error) {
+	// Probe the registry /v2/ endpoint to get the WWW-Authenticate header
+	probeURL := fmt.Sprintf("%s://%s/v2/", scheme, ref.Registry)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, probeURL, nil)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			logger.Log.Warnf("Failed to close probe response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		return "", fmt.Errorf("expected 401 from /v2/, got %d", resp.StatusCode)
+	}
+
+	// Parse: Bearer realm="https://...",service="...",scope="..."
+	wwwAuth := resp.Header.Get("WWW-Authenticate")
+	realm, service, scope := parseBearerChallenge(wwwAuth, ref)
+	if realm == "" {
+		return "", fmt.Errorf("no Bearer realm in WWW-Authenticate: %s", wwwAuth)
+	}
+
+	// Build token request URL
+	tokenURL := fmt.Sprintf("%s?service=%s&scope=%s",
+		realm,
+		url.QueryEscape(service),
+		url.QueryEscape(scope),
+	)
+
+	tokenReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, tokenURL, nil)
+	if err != nil {
+		return "", err
+	}
+	tokenReq.SetBasicAuth(creds.Username, creds.Password)
+
+	tokenResp, err := c.HTTPClient.Do(tokenReq)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if err := tokenResp.Body.Close(); err != nil {
+			logger.Log.Warnf("Failed to close token response body: %v", err)
+		}
+	}()
+
+	if tokenResp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("token endpoint returned %d", tokenResp.StatusCode)
+	}
+
+	var result struct {
+		Token       string `json:"token"`
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.NewDecoder(tokenResp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	token := result.Token
+	if token == "" {
+		token = result.AccessToken
+	}
+	if token == "" {
+		return "", fmt.Errorf("empty token from auth service")
+	}
+
+	return token, nil
+}
+
+// parseBearerChallenge parses the WWW-Authenticate Bearer header.
+// Example: Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:user/repo:pull"
+func parseBearerChallenge(header string, ref ImageRef) (realm, service, scope string) {
+	header = strings.TrimPrefix(header, "Bearer ")
+
+	// Default scope for pulling
+	scope = fmt.Sprintf("repository:%s:pull", ref.Name)
+	service = ref.Registry
+
+	for _, part := range strings.Split(header, ",") {
+		part = strings.TrimSpace(part)
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(kv[0])
+		val := strings.Trim(strings.TrimSpace(kv[1]), `"`)
+		switch key {
+		case "realm":
+			realm = val
+		case "service":
+			service = val
+		case "scope":
+			scope = val
+		}
+	}
+
+	return realm, service, scope
+}
+
+// fetchDigest performs a HEAD request and extracts the Docker-Content-Digest header.
+// authHeader can be a full Authorization header value (e.g. "Bearer <token>" or "Basic <b64>")
+// or an empty string for anonymous access.
+func (c *Client) fetchDigest(manifestURL string, authHeader string) (string, error) {
 	req, err := http.NewRequestWithContext(
 		context.Background(),
 		http.MethodHead,
-		url,
+		manifestURL,
 		nil,
 	)
 	if err != nil {
 		return "", err
 	}
 
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
 	}
 	req.Header.Set("Accept", strings.Join([]string{
 		"application/vnd.docker.distribution.manifest.v2+json",
@@ -210,12 +357,12 @@ func (c *Client) HasUpdate(localDigest string, image string) (bool, string, erro
 
 // getDockerHubToken gets a Bearer token from Docker Hub
 func getDockerHubToken(imageName string, client *http.Client) (string, error) {
-	url := fmt.Sprintf(
-		"https://auth.docker.io/token?service=registry.docker.io&scope=repository:%s:pull",
-		imageName,
+	tokenURL := fmt.Sprintf(
+		"%s?service=registry.docker.io&scope=repository:%s:pull",
+		dockerHubTokenURL, imageName,
 	)
 
-	resp, err := client.Get(url)
+	resp, err := client.Get(tokenURL)
 	if err != nil {
 		return "", err
 	}

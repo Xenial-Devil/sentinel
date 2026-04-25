@@ -14,6 +14,7 @@ This image is built for operators who want update automation but still need prod
 - Quick Start
 - Deployment Patterns
 - Configuration Reference
+- Private Registry Authentication
 - Container Label Reference
 - API Reference
 - Metrics Reference
@@ -231,6 +232,18 @@ If SENTINEL_WATCH_ALL=true, labels are optional.
 | SENTINEL_TEMPLATE_STARTUP        | empty              | Custom template for startup event        |
 | SENTINEL_NOTIFY_URL              | empty              | Legacy/reserved notification URL field   |
 
+## Private Registry Authentication
+
+Sentinel supports pulling images from private registries (e.g., ghcr.io, private Docker Hub, GitLab). Authentication credentials can be provided via environment variables or by mounting an existing Docker `config.json`.
+
+Sentinel evaluates credentials in the following priority for each registry:
+1. **Generic Credentials**: `REPO_USER` and `REPO_PASS` apply as a fallback to all registries.
+2. **Per-Registry Override**: Set `SENTINEL_REGISTRY_USER_<HOST>` and `SENTINEL_REGISTRY_PASS_<HOST>` to isolate credentials per registry.
+3. **Token-Only Override**: Set `SENTINEL_REGISTRY_TOKEN_<HOST>` for registries that support token-only access (like GitHub PATs).
+4. **Docker Config**: Automatically loads credentials from the `DOCKER_CONFIG` directory if mounted (e.g., `/root/.docker`).
+
+*Hostname Normalization*: For per-registry variables, convert the registry hostname to uppercase and replace dots (`.`), colons (`:`), and hyphens (`-`) with underscores (`_`). For example, `ghcr.io` becomes `GHCR_IO`.
+
 ## Container Label Reference
 
 Sentinel supports per-container behavior through labels.
@@ -403,7 +416,7 @@ If approval persistence is not configured, approval state can be lost across con
 - Compose stack update endpoint performs container restarts for detected stack services.
 - Hook commands run in Sentinel container context using shell execution.
 - If API token is unset, protected routes allow unauthenticated access.
-- Private registry digest checks may require anonymous access unless custom auth flow is extended.
+- Private registries are fully supported via Basic Auth and Bearer Token (WWW-Authenticate) challenge flows.
 
 ## Troubleshooting
 

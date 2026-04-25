@@ -54,6 +54,8 @@ services:
     image: isubroto/sentinel:latest
     restart: unless-stopped
     init: true
+    env_file:
+      - .env                         # ← registry credentials live here
     environment:
       SENTINEL_DOCKER_HOST: unix:///var/run/docker.sock
       SENTINEL_API_ENABLED: "true"
@@ -76,8 +78,14 @@ services:
 ```
 
 ```bash
+# 1. Create your credentials file from the template
+cp .env.example .env
+# Fill in REPO_USER and REPO_PASS if using private registries (ghcr.io, etc.)
+
+# 2. Start Sentinel
 docker compose up -d
 ```
+
 
 ### Label-Based Opt-In Mode (Safer for Shared Hosts)
 
@@ -90,9 +98,150 @@ labels:
 
 ---
 
+## 🔑 Private Registry Authentication
+
+If your containers use images from **ghcr.io**, private Docker Hub repos, GitLab registry, or any other authenticated registry, Sentinel needs credentials to check for updates and pull new images.
+
+### Why you see this error
+
+```
+private registry auth not configured for ghcr.io
+```
+
+This is the exact flow that triggers it:
+
+```
+getPrivateDigest("ghcr.io/org/app:latest")
+  → anonymous fetch → 401 Unauthorized  (expected for private images)
+  → GetCredentials("ghcr.io")  → nil     ← REPO_USER/REPO_PASS are empty
+  → "private registry auth not configured for ghcr.io"  ❌
+```
+
+The fix is simply to provide credentials in your `.env` file.
+
+### Step 1 – Generate a GitHub Personal Access Token (for ghcr.io)
+
+```
+GitHub → Settings → Developer Settings
+  → Personal Access Tokens → Tokens (classic)
+  → New Token
+
+Required scopes:
+  ✅ read:packages   (required – pull images)
+  ✅ write:packages  (optional – only if Sentinel needs to push)
+```
+
+### Step 2 – Configure credentials (pick one option)
+
+Copy `.env.example` to `.env` then fill in your values:
+
+```bash
+cp .env.example .env
+```
+
+**Option A — Generic (simplest, works for any registry)**
+
+```env
+REPO_USER=your_github_username
+REPO_PASS=ghp_yourPersonalAccessToken
+```
+
+**Option B — Per-registry (recommended when you use multiple registries)**
+
+```env
+# ghcr.io
+SENTINEL_REGISTRY_USER_GHCR_IO=your_github_username
+SENTINEL_REGISTRY_PASS_GHCR_IO=ghp_yourPersonalAccessToken
+
+# Docker Hub private
+SENTINEL_REGISTRY_USER_REGISTRY_1_DOCKER_IO=dockerhub_user
+SENTINEL_REGISTRY_PASS_REGISTRY_1_DOCKER_IO=dockerhub_token
+```
+
+**Option C — Token only (GitHub PAT without username)**
+
+```env
+SENTINEL_REGISTRY_TOKEN_GHCR_IO=ghp_yourPersonalAccessToken
+```
+
+**Option D — Mount existing Docker config.json**
+
+```env
+# Directory containing config.json (e.g. after docker login ghcr.io on the host)
+DOCKER_CONFIG=/root/.docker
+```
+
+And mount it into the container:
+
+```yaml
+volumes:
+  - /root/.docker:/root/.docker:ro
+```
+
+### Step 3 – Ensure your docker-compose.yml has env_file
+
+```yaml
+services:
+  sentinel:
+    image: isubroto/sentinel:latest
+    env_file:
+      - .env                         # ← loads REPO_USER, REPO_PASS, etc.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/app/data
+
+  web:
+    image: ghcr.io/isubroto/city_pos_fe:latest
+    labels:
+      com.sentinel.watch.enable: "true"
+    restart: always
+
+  app:
+    image: ghcr.io/isubroto/city_pos_be:latest
+    labels:
+      com.sentinel.watch.enable: "true"
+    restart: always
+```
+
+### Step 4 – Verify and restart
+
+```bash
+# Test your PAT manually first
+echo "ghp_yourToken" | docker login ghcr.io -u your_username --password-stdin
+
+# Restart Sentinel to pick up .env changes
+docker compose down && docker compose up -d
+
+# Watch logs – should now see update checks instead of auth errors
+docker compose logs sentinel -f
+```
+
+### Credential priority order
+
+Sentinel checks credentials in this order for each registry:
+
+| Priority | Source | Example |
+|---|---|---|
+| 1st | `REPO_USER` + `REPO_PASS` | Generic, all registries |
+| 2nd | `SENTINEL_REGISTRY_USER_<HOST>` + `SENTINEL_REGISTRY_PASS_<HOST>` | Per-registry override |
+| 3rd | `SENTINEL_REGISTRY_TOKEN_<HOST>` | Token-only variant |
+| 4th | `DOCKER_CONFIG` dir → `config.json` | Existing Docker login |
+
+Hostname normalization for env var keys: uppercase, replace `.` `:` `-` with `_`
+
+```
+ghcr.io              → GHCR_IO
+registry.k8s.io      → REGISTRY_K8S_IO
+my-registry:5000     → MY_REGISTRY_5000
+```
+
+---
+
+
 ## 🎯 Use Case Playbooks
 
 ### 1. Dedicated host with fully automatic updates
+
 
 Use this when the Docker host runs only services that are safe to auto-update.
 
