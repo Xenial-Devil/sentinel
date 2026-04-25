@@ -88,7 +88,18 @@ func (u *Updater) CheckAndUpdate(
 	}
 
 	// ── Check registry ────────────────────────────────────────────────────────
-	hasUpdate, _, err := u.Registry.HasUpdate(localDigest, ct.Image)
+	var customCreds *registry.Credentials
+	userLabel := ct.Labels["sentinel.registry.user"]
+	passLabel := ct.Labels["sentinel.registry.pass"]
+
+	if userLabel != "" && passLabel != "" {
+		customCreds = &registry.Credentials{
+			Username: userLabel,
+			Password: passLabel,
+		}
+	}
+
+	hasUpdate, _, err := u.Registry.HasUpdate(localDigest, ct.Image, customCreds)
 	if err != nil {
 		logger.Log.Warnf("Failed to check registry for %s: %v", ct.Name, err)
 		result.Error = err
@@ -122,7 +133,7 @@ func (u *Updater) CheckAndUpdate(
 	// ── No-restart: pull only ─────────────────────────────────────────────────
 	if noRestart || u.Config.NoRestart {
 		logger.Log.Infof("📥  [NO-RESTART] %s pulling image but not restarting", ct.Name)
-		if err := u.pullImage(ct.Image); err != nil {
+		if err := u.pullImage(ct); err != nil {
 			logger.LogImagePullFailed(ct.Name, ct.Image, err)
 			result.Error = err
 			return result
@@ -165,7 +176,7 @@ func (u *Updater) applyUpdate(ct docker.ContainerInfo, result *UpdateResult) err
 	// Pull
 	logger.LogImagePullStart(ct.Name, ct.Image)
 	pullStart := time.Now()
-	if err := u.pullImage(ct.Image); err != nil {
+	if err := u.pullImage(ct); err != nil {
 		logger.LogImagePullFailed(ct.Name, ct.Image, err)
 		return fmt.Errorf("failed to pull image: %v", err)
 	}
@@ -241,7 +252,7 @@ func (u *Updater) applyRollingRestart(ct docker.ContainerInfo, result UpdateResu
 	if !result.NoPull {
 		logger.LogImagePullStart(ct.Name, ct.Image)
 		pullStart := time.Now()
-		if err := u.pullImage(ct.Image); err != nil {
+		if err := u.pullImage(ct); err != nil {
 			logger.LogImagePullFailed(ct.Name, ct.Image, err)
 			result.Error = err
 			return result
@@ -317,13 +328,54 @@ func (u *Updater) applyRestartOnly(ct docker.ContainerInfo, result UpdateResult)
 }
 
 // pullImage pulls a new image from registry, using credentials for private registries.
-func (u *Updater) pullImage(image string) error {
+func (u *Updater) pullImage(ct docker.ContainerInfo) error {
 	ctx := context.Background()
 
-	// Resolve auth header for the image's registry (empty string for public images)
-	ref := registry.ParseImageRef(image)
-	authHeader := registry.GetAuthHeader(ref.Registry)
+	var customCreds *registry.Credentials
+	userLabel := ct.Labels["sentinel.registry.user"]
+	passLabel := ct.Labels["sentinel.registry.pass"]
 
+	if userLabel != "" && passLabel != "" {
+		customCreds = &registry.Credentials{
+			Username: userLabel,
+			Password: passLabel,
+		}
+	}
+
+	image := ct.Image
+	ref := registry.ParseImageRef(image)
+
+	if customCreds != nil {
+		logger.Log.Infof("Using custom credentials from labels for %s", ct.Name)
+		authHeader := registry.EncodeAuthHeader(customCreds)
+		return u.doPull(ctx, image, authHeader)
+	}
+
+	logger.Log.Infof("Attempting public pull for %s", ct.Name)
+	err := u.doPull(ctx, image, "")
+	if err == nil {
+		logger.Log.Infof("Public pull successful for %s", ct.Name)
+		return nil
+	}
+
+	logger.Log.Infof("Public pull failed for %s, trying with global credentials: %v", ct.Name, err)
+
+	authHeader := registry.GetAuthHeader(ref.Registry)
+	if authHeader == "" {
+		return fmt.Errorf("public pull failed and no global credentials found: %v", err)
+	}
+
+	err = u.doPull(ctx, image, authHeader)
+	if err == nil {
+		logger.Log.Infof("Credential pull successful for %s", ct.Name)
+		return nil
+	}
+
+	logger.Log.Errorf("Credential pull failed for %s: %v", ct.Name, err)
+	return err
+}
+
+func (u *Updater) doPull(ctx context.Context, image, authHeader string) error {
 	reader, err := u.Client.CLI.ImagePull(
 		ctx,
 		image,

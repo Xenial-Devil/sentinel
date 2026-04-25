@@ -161,7 +161,7 @@ func TestGetDockerHubToken_Success(t *testing.T) {
 	old := dockerHubTokenURL
 	dockerHubTokenURL = srv.URL
 	defer func() { dockerHubTokenURL = old }()
-	tok, err := getDockerHubToken("org/app", srv.Client())
+	tok, err := getDockerHubToken("org/app", srv.Client(), nil)
 	if err != nil || tok != "mytoken" { t.Errorf("got %q %v", tok, err) }
 }
 
@@ -173,7 +173,7 @@ func TestGetDockerHubToken_EmptyToken(t *testing.T) {
 	old := dockerHubTokenURL
 	dockerHubTokenURL = srv.URL
 	defer func() { dockerHubTokenURL = old }()
-	_, err := getDockerHubToken("org/app", srv.Client())
+	_, err := getDockerHubToken("org/app", srv.Client(), nil)
 	if err == nil || !strings.Contains(err.Error(), "empty token") { t.Errorf("got %v", err) }
 }
 
@@ -185,7 +185,7 @@ func TestGetDockerHubToken_BadJSON(t *testing.T) {
 	old := dockerHubTokenURL
 	dockerHubTokenURL = srv.URL
 	defer func() { dockerHubTokenURL = old }()
-	_, err := getDockerHubToken("org/app", srv.Client())
+	_, err := getDockerHubToken("org/app", srv.Client(), nil)
 	if err == nil { t.Error("expected JSON decode error") }
 }
 
@@ -193,32 +193,121 @@ func TestGetDockerHubToken_RequestFails(t *testing.T) {
 	old := dockerHubTokenURL
 	dockerHubTokenURL = "http://127.0.0.1:0"
 	defer func() { dockerHubTokenURL = old }()
-	_, err := getDockerHubToken("org/app", &http.Client{})
+	_, err := getDockerHubToken("org/app", &http.Client{}, nil)
 	if err == nil { t.Error("expected connection error") }
 }
 
 // ── getDockerHubDigest ────────────────────────────────────────────────────────
 
-func TestGetDockerHubDigest_Success(t *testing.T) {
-	// One server handles both token + manifest requests
+// TestGetDockerHubDigest_PublicAnonSuccess: public image resolved anonymously — no creds needed.
+func TestGetDockerHubDigest_PublicAnonSuccess(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "token") || r.URL.RawQuery != "" {
-			_ = json.NewEncoder(w).Encode(map[string]string{"token": "tok"})
+		if r.URL.RawQuery != "" {
+			if r.Header.Get("Authorization") != "" {
+				t.Error("expected anonymous token request, got Authorization header")
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"token": "anonTok"})
 			return
 		}
 		w.Header().Set("Docker-Content-Digest", testDigest)
 	}))
 	defer srv.Close()
 
-	oldT := dockerHubTokenURL
-	oldM := dockerHubManifestBase
+	oldT, oldM := dockerHubTokenURL, dockerHubManifestBase
 	dockerHubTokenURL = srv.URL
 	dockerHubManifestBase = srv.URL + "/v2"
 	defer func() { dockerHubTokenURL = oldT; dockerHubManifestBase = oldM }()
 
-	ref := ImageRef{Registry: "registry-1.docker.io", Name: "library/nginx", Tag: "latest"}
-	d, err := newClient(srv).getDockerHubDigest(ref)
-	if err != nil || d != testDigest { t.Errorf("got %q %v", d, err) }
+	// Generic GHCR creds — must NOT be sent to Docker Hub
+	t.Setenv("REPO_USER", "ghcr-user")
+	t.Setenv("REPO_PASS", "ghcr-pass")
+
+	ref := ImageRef{Registry: "registry-1.docker.io", Name: "library/postgres", Tag: "17-alpine"}
+	d, err := newClient(srv).getDockerHubDigest(ref, nil)
+	if err != nil || d != testDigest {
+		t.Errorf("got %q %v", d, err)
+	}
+}
+
+// TestGetDockerHubDigest_RateLimitedFallsBackToSpecificCreds: anon returns 401 on the
+// manifest (rate-limit), then retries with docker.io-specific credentials only.
+func TestGetDockerHubDigest_RateLimitedFallsBackToSpecificCreds(t *testing.T) {
+	var tokenAuths []string
+	var manifestAttempts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.RawQuery != "" {
+			// Token endpoint — record whether creds were supplied
+			tokenAuths = append(tokenAuths, r.Header.Get("Authorization"))
+			_ = json.NewEncoder(w).Encode(map[string]string{"token": "validtok"})
+			return
+		}
+		// Manifest endpoint: reject first attempt (anon), accept second (authenticated)
+		manifestAttempts++
+		if manifestAttempts == 1 {
+			w.WriteHeader(http.StatusUnauthorized) // rate-limited
+			return
+		}
+		w.Header().Set("Docker-Content-Digest", testDigest)
+	}))
+	defer srv.Close()
+
+	oldT, oldM := dockerHubTokenURL, dockerHubManifestBase
+	dockerHubTokenURL = srv.URL
+	dockerHubManifestBase = srv.URL + "/v2"
+	defer func() { dockerHubTokenURL = oldT; dockerHubManifestBase = oldM }()
+
+	t.Setenv("REPO_USER", "ghcr-user")                                  // generic — must NOT be used
+	t.Setenv("REPO_PASS", "ghcr-pass")
+	t.Setenv("SENTINEL_REGISTRY_USER_REGISTRY_1_DOCKER_IO", "dh-user") // docker.io-specific
+	t.Setenv("SENTINEL_REGISTRY_PASS_REGISTRY_1_DOCKER_IO", "dh-pass")
+
+	ref := ImageRef{Registry: "registry-1.docker.io", Name: "library/postgres", Tag: "17-alpine"}
+	d, err := newClient(srv).getDockerHubDigest(ref, nil)
+	if err != nil || d != testDigest {
+		t.Errorf("got %q %v", d, err)
+	}
+	// First token request must be anonymous
+	if len(tokenAuths) < 2 {
+		t.Fatalf("expected 2 token requests, got %d", len(tokenAuths))
+	}
+	if tokenAuths[0] != "" {
+		t.Errorf("first token request should be anonymous, got auth=%q", tokenAuths[0])
+	}
+	// Second token request must carry docker.io-specific credentials (not generic GHCR ones)
+	if !strings.HasPrefix(tokenAuths[1], "Basic ") {
+		t.Errorf("second token request should carry Basic auth, got %q", tokenAuths[1])
+	}
+}
+
+// TestGetDockerHubDigest_RateLimitedNoDockerHubCreds: anon returns 401, generic
+// REPO_USER/REPO_PASS exist but must NOT be used — should return a clear error.
+func TestGetDockerHubDigest_RateLimitedNoDockerHubCreds(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.RawQuery != "" {
+			_ = json.NewEncoder(w).Encode(map[string]string{"token": "anon"})
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	oldT, oldM := dockerHubTokenURL, dockerHubManifestBase
+	dockerHubTokenURL = srv.URL
+	dockerHubManifestBase = srv.URL + "/v2"
+	defer func() { dockerHubTokenURL = oldT; dockerHubManifestBase = oldM }()
+
+	t.Setenv("REPO_USER", "ghcr-user") // generic creds — must not be forwarded
+	t.Setenv("REPO_PASS", "ghcr-pass")
+	t.Setenv("DOCKER_CONFIG", t.TempDir()) // empty dir — no docker.io entry
+
+	ref := ImageRef{Registry: "registry-1.docker.io", Name: "library/postgres", Tag: "17-alpine"}
+	_, err := newClient(srv).getDockerHubDigest(ref, nil)
+	if err == nil {
+		t.Error("expected error when no docker.io-specific credentials configured")
+	}
+	if !strings.Contains(err.Error(), "no docker.io credentials") {
+		t.Errorf("unexpected error message: %v", err)
+	}
 }
 
 func TestGetDockerHubDigest_TokenFail(t *testing.T) {
@@ -226,8 +315,10 @@ func TestGetDockerHubDigest_TokenFail(t *testing.T) {
 	dockerHubTokenURL = "http://127.0.0.1:0"
 	defer func() { dockerHubTokenURL = old }()
 	ref := ImageRef{Name: "library/nginx", Tag: "latest"}
-	_, err := New().getDockerHubDigest(ref)
-	if err == nil { t.Error("expected error") }
+	_, err := New().getDockerHubDigest(ref, nil)
+	if err == nil {
+		t.Error("expected error")
+	}
 }
 
 // ── GetRemoteDigest – routing ─────────────────────────────────────────────────
@@ -248,7 +339,7 @@ func TestGetRemoteDigest_RoutesToDockerHub(t *testing.T) {
 	dockerHubManifestBase = srv.URL
 	defer func() { dockerHubTokenURL = oldT; dockerHubManifestBase = oldM }()
 
-	d, err := newClient(srv).GetRemoteDigest("nginx:latest")
+	d, err := newClient(srv).GetRemoteDigest("nginx:latest", nil)
 	if err != nil || d != testDigest { t.Errorf("got %q %v", d, err) }
 }
 
@@ -259,7 +350,7 @@ func TestGetRemoteDigest_RoutesToPrivate(t *testing.T) {
 	defer srv.Close()
 	host := strings.TrimPrefix(srv.URL, "http://")
 	// 127.x → http scheme used by getPrivateDigest
-	d, err := newClient(srv).GetRemoteDigest(fmt.Sprintf("%s/org/app:latest", host))
+	d, err := newClient(srv).GetRemoteDigest(fmt.Sprintf("%s/org/app:latest", host), nil)
 	if err != nil || d != testDigest { t.Errorf("got %q %v", d, err) }
 }
 
@@ -272,7 +363,7 @@ func TestPrivateDigest_AnonSuccess(t *testing.T) {
 	defer srv.Close()
 	host := strings.TrimPrefix(srv.URL, "http://")
 	ref := ImageRef{Registry: host, Name: "app", Tag: "latest"}
-	d, err := newClient(srv).getPrivateDigest(ref)
+	d, err := newClient(srv).getPrivateDigest(ref, nil)
 	if err != nil || d != testDigest { t.Errorf("got %q %v", d, err) }
 }
 
@@ -288,7 +379,7 @@ func TestPrivateDigest_AnonFail_NoCreds(t *testing.T) {
 
 	host := strings.TrimPrefix(srv.URL, "http://")
 	ref := ImageRef{Registry: host, Name: "app", Tag: "latest"}
-	_, err := newClient(srv).getPrivateDigest(ref)
+	_, err := newClient(srv).getPrivateDigest(ref, nil)
 	if err == nil || !strings.Contains(err.Error(), "auth not configured") {
 		t.Errorf("got %v", err)
 	}
@@ -309,7 +400,7 @@ func TestPrivateDigest_BasicAuthSuccess(t *testing.T) {
 
 	host := strings.TrimPrefix(srv.URL, "http://")
 	ref := ImageRef{Registry: host, Name: "app", Tag: "latest"}
-	d, err := newClient(srv).getPrivateDigest(ref)
+	d, err := newClient(srv).getPrivateDigest(ref, nil)
 	if err != nil || d != testDigest { t.Errorf("got %q %v", d, err) }
 }
 
@@ -344,7 +435,7 @@ func TestPrivateDigest_BearerSuccess(t *testing.T) {
 
 	host := strings.TrimPrefix(srv.URL, "http://")
 	ref := ImageRef{Registry: host, Name: "app", Tag: "latest"}
-	d, err := newClient(srv).getPrivateDigest(ref)
+	d, err := newClient(srv).getPrivateDigest(ref, nil)
 	if err != nil || d != testDigest { t.Errorf("got %q %v", d, err) }
 }
 
@@ -370,7 +461,7 @@ func TestPrivateDigest_BearerFetchFails(t *testing.T) {
 
 	host := strings.TrimPrefix(srv.URL, "http://")
 	ref := ImageRef{Registry: host, Name: "app", Tag: "latest"}
-	_, err := newClient(srv).getPrivateDigest(ref)
+	_, err := newClient(srv).getPrivateDigest(ref, nil)
 	if err == nil { t.Error("expected error when bearer fetch fails") }
 }
 
@@ -479,7 +570,7 @@ func TestHasUpdate_UpdateAvailable(t *testing.T) {
 	dockerHubManifestBase = srv.URL
 	defer func() { dockerHubTokenURL = oldT; dockerHubManifestBase = oldM }()
 
-	ok, remote, err := newClient(srv).HasUpdate("sha256:old", "nginx:latest")
+	ok, remote, err := newClient(srv).HasUpdate("sha256:old", "nginx:latest", nil)
 	if err != nil { t.Fatalf("err=%v", err) }
 	if !ok        { t.Error("expected hasUpdate=true") }
 	if remote != testDigest { t.Errorf("remote=%q", remote) }
@@ -501,7 +592,7 @@ func TestHasUpdate_UpToDate(t *testing.T) {
 	dockerHubManifestBase = srv.URL
 	defer func() { dockerHubTokenURL = oldT; dockerHubManifestBase = oldM }()
 
-	ok, remote, err := newClient(srv).HasUpdate(testDigest, "nginx:latest")
+	ok, remote, err := newClient(srv).HasUpdate(testDigest, "nginx:latest", nil)
 	if err != nil { t.Fatalf("err=%v", err) }
 	if ok         { t.Error("expected hasUpdate=false") }
 	if remote != testDigest { t.Errorf("remote=%q", remote) }
@@ -511,6 +602,6 @@ func TestHasUpdate_RegistryError(t *testing.T) {
 	old := dockerHubTokenURL
 	dockerHubTokenURL = "http://127.0.0.1:0"
 	defer func() { dockerHubTokenURL = old }()
-	ok, _, err := New().HasUpdate("sha256:old", "nginx:latest")
+	ok, _, err := New().HasUpdate("sha256:old", "nginx:latest", nil)
 	if err == nil || ok { t.Error("expected error") }
 }

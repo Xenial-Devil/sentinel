@@ -95,7 +95,7 @@ func isRegistry(s string) bool {
 }
 
 // GetRemoteDigest gets the digest of an image from its registry
-func (c *Client) GetRemoteDigest(image string) (string, error) {
+func (c *Client) GetRemoteDigest(image string, customCreds *Credentials) (string, error) {
 	ref := ParseImageRef(image)
 
 	logger.Log.Debugf("Checking registry: registry=%s name=%s tag=%s",
@@ -103,30 +103,73 @@ func (c *Client) GetRemoteDigest(image string) (string, error) {
 
 	// Docker Hub needs token auth
 	if strings.Contains(ref.Registry, "docker.io") {
-		return c.getDockerHubDigest(ref)
+		return c.getDockerHubDigest(ref, customCreds)
 	}
 
 	// Private registry - attempt v2 without auth first
-	return c.getPrivateDigest(ref)
+	return c.getPrivateDigest(ref, customCreds)
 }
 
-// getDockerHubDigest gets digest from Docker Hub using token auth
-func (c *Client) getDockerHubDigest(ref ImageRef) (string, error) {
-	token, err := getDockerHubToken(ref.Name, c.HTTPClient)
-	if err != nil {
-		return "", fmt.Errorf("failed to get docker hub token: %v", err)
-	}
-
+// getDockerHubDigest gets digest from Docker Hub using token auth.
+//
+// Strategy:
+//  1. Try with an anonymous token — works for public images within the rate limit.
+//  2. On 401 (rate-limited or private image), look for Docker Hub-specific
+//     credentials (SENTINEL_REGISTRY_USER_REGISTRY_1_DOCKER_IO or a
+//     ~/.docker/config.json entry for docker.io).
+//     NOTE: the generic REPO_USER/REPO_PASS are intentionally skipped here
+//     because those credentials belong to other private registries (e.g. GHCR)
+//     and must not be forwarded to Docker Hub.
+func (c *Client) getDockerHubDigest(ref ImageRef, customCreds *Credentials) (string, error) {
 	manifestURL := fmt.Sprintf("%s/%s/manifests/%s",
 		dockerHubManifestBase, ref.Name, ref.Tag)
 
-	return c.fetchDigest(manifestURL, token)
+	if customCreds == nil {
+		// 1. Anonymous token attempt
+		anonToken, err := getDockerHubToken(ref.Name, c.HTTPClient, nil)
+		if err != nil {
+			return "", fmt.Errorf("failed to get docker hub token: %v", err)
+		}
+
+		digest, err := c.fetchDigest(manifestURL, anonToken)
+		if err == nil {
+			return digest, nil
+		}
+
+		// 2. Anonymous failed (rate-limited or private) — try Docker Hub-specific creds only
+		logger.Log.Debugf("Anonymous Docker Hub fetch failed for %s: %v — trying docker.io-specific credentials", ref.Name, err)
+	}
+
+	// Use GetRegistrySpecificCredentials so generic REPO_USER/REPO_PASS (meant for
+	// GHCR etc.) are never forwarded to Docker Hub.
+	var creds *Credentials
+	if customCreds != nil {
+		creds = customCreds
+	} else {
+		var _ error
+		creds, _ = GetRegistrySpecificCredentials(ref.Registry)
+		if creds == nil {
+			// Also check "docker.io" alias used in ~/.docker/config.json
+			creds, _ = GetRegistrySpecificCredentials("docker.io")
+		}
+	}
+	if creds == nil {
+		return "", fmt.Errorf("registry returned 401 unauthorized and no docker.io credentials are configured")
+	}
+
+	logger.Log.Debugf("Retrying Docker Hub fetch for %s with registry-specific credentials", ref.Name)
+	authedToken, err := getDockerHubToken(ref.Name, c.HTTPClient, creds)
+	if err != nil {
+		return "", fmt.Errorf("failed to get authenticated docker hub token: %v", err)
+	}
+
+	return c.fetchDigest(manifestURL, authedToken)
 }
 
 // getPrivateDigest gets digest from a private registry.
 // It first tries anonymous access; on 401 it attempts to authenticate
 // using credentials from env vars or ~/.docker/config.json.
-func (c *Client) getPrivateDigest(ref ImageRef) (string, error) {
+func (c *Client) getPrivateDigest(ref ImageRef, customCreds *Credentials) (string, error) {
 	scheme := "https"
 	// Use http for localhost or plain IP with port
 	if ref.Registry == "localhost" || strings.HasPrefix(ref.Registry, "127.") {
@@ -138,18 +181,29 @@ func (c *Client) getPrivateDigest(ref ImageRef) (string, error) {
 		scheme, ref.Registry, ref.Name, ref.Tag,
 	)
 
-	// 1. Try anonymous first
-	digest, err := c.fetchDigest(manifestURL, "")
-	if err == nil {
-		return digest, nil
+	var digest string
+	var err error
+
+	if customCreds == nil {
+		// 1. Try anonymous first
+		digest, err = c.fetchDigest(manifestURL, "")
+		if err == nil {
+			return digest, nil
+		}
+
+		logger.Log.Debugf("Anonymous fetch failed for %s: %v — trying authenticated", ref.Registry, err)
 	}
 
-	logger.Log.Debugf("Anonymous fetch failed for %s: %v — trying authenticated", ref.Registry, err)
-
 	// 2. Load credentials for this registry
-	creds, credsErr := GetCredentials(ref.Registry)
-	if credsErr != nil {
-		logger.Log.Debugf("Failed to load credentials for %s: %v", ref.Registry, credsErr)
+	var creds *Credentials
+	if customCreds != nil {
+		creds = customCreds
+	} else {
+		var credsErr error
+		creds, credsErr = GetCredentials(ref.Registry)
+		if credsErr != nil {
+			logger.Log.Debugf("Failed to load credentials for %s: %v", ref.Registry, credsErr)
+		}
 	}
 
 	if creds == nil {
@@ -157,7 +211,7 @@ func (c *Client) getPrivateDigest(ref ImageRef) (string, error) {
 	}
 
 	// 3. Try Basic auth
-	basicHeader := GetBasicAuthHeader(ref.Registry)
+	basicHeader := GetBasicAuthHeaderFromCreds(creds)
 	digest, err = c.fetchDigest(manifestURL, basicHeader)
 	if err == nil {
 		return digest, nil
@@ -336,8 +390,8 @@ func (c *Client) fetchDigest(manifestURL string, authHeader string) (string, err
 }
 
 // HasUpdate checks if a newer image is available
-func (c *Client) HasUpdate(localDigest string, image string) (bool, string, error) {
-	remoteDigest, err := c.GetRemoteDigest(image)
+func (c *Client) HasUpdate(localDigest string, image string, customCreds *Credentials) (bool, string, error) {
+	remoteDigest, err := c.GetRemoteDigest(image, customCreds)
 	if err != nil {
 		return false, "", err
 	}
@@ -355,14 +409,26 @@ func (c *Client) HasUpdate(localDigest string, image string) (bool, string, erro
 	return false, remoteDigest, nil
 }
 
-// getDockerHubToken gets a Bearer token from Docker Hub
-func getDockerHubToken(imageName string, client *http.Client) (string, error) {
+// getDockerHubToken gets a Bearer token from Docker Hub.
+// If creds are provided, they are sent as Basic auth to the token endpoint so
+// that Docker Hub applies the authenticated rate limit (unlimited) instead of
+// the anonymous one (100 pulls / 6 h / IP).
+func getDockerHubToken(imageName string, client *http.Client, creds *Credentials) (string, error) {
 	tokenURL := fmt.Sprintf(
 		"%s?service=registry.docker.io&scope=repository:%s:pull",
 		dockerHubTokenURL, imageName,
 	)
 
-	resp, err := client.Get(tokenURL)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, tokenURL, nil)
+	if err != nil {
+		return "", err
+	}
+	if creds != nil {
+		logger.Log.Debugf("Using authenticated Docker Hub token request for %s", imageName)
+		req.SetBasicAuth(creds.Username, creds.Password)
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -371,6 +437,10 @@ func getDockerHubToken(imageName string, client *http.Client) (string, error) {
 			logger.Log.Warnf("Failed to close auth response body: %v", err)
 		}
 	}()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("docker hub token endpoint returned %d", resp.StatusCode)
+	}
 
 	var result struct {
 		Token string `json:"token"`

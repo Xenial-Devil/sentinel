@@ -390,3 +390,45 @@ func TestGetBasicAuthHeader_NoCreds(t *testing.T) {
 		t.Errorf("expected empty, got %q", h)
 	}
 }
+
+// ── GetRegistrySpecificCredentials ───────────────────────────────────────────
+
+// TestGetRegistrySpecificCredentials_SkipsGenericEnv verifies that REPO_USER/REPO_PASS
+// are never returned — they belong to other registries (e.g. GHCR) and must not
+// be forwarded to Docker Hub for public images.
+func TestGetRegistrySpecificCredentials_SkipsGenericEnv(t *testing.T) {
+	t.Setenv("REPO_USER", "ghcr-user")
+	t.Setenv("REPO_PASS", "ghcr-pass")
+	t.Setenv("DOCKER_CONFIG", t.TempDir())
+	clearPerRegistryCreds(t, "registry-1.docker.io")
+
+	c, err := GetRegistrySpecificCredentials("registry-1.docker.io")
+	if err != nil || c != nil {
+		t.Errorf("generic REPO_USER/REPO_PASS must not be returned; got %v err=%v", c, err)
+	}
+}
+
+func TestGetRegistrySpecificCredentials_PerRegistryEnvWorks(t *testing.T) {
+	_ = os.Unsetenv("REPO_USER")
+	_ = os.Unsetenv("REPO_PASS")
+	t.Setenv("SENTINEL_REGISTRY_USER_REGISTRY_1_DOCKER_IO", "dh-user")
+	t.Setenv("SENTINEL_REGISTRY_PASS_REGISTRY_1_DOCKER_IO", "dh-pass")
+
+	c, err := GetRegistrySpecificCredentials("registry-1.docker.io")
+	if err != nil || c == nil || c.Username != "dh-user" || c.Password != "dh-pass" {
+		t.Errorf("expected docker.io-specific creds; got %v err=%v", c, err)
+	}
+}
+
+func TestGetRegistrySpecificCredentials_DockerConfigFallback(t *testing.T) {
+	_ = os.Unsetenv("REPO_USER")
+	_ = os.Unsetenv("REPO_PASS")
+	clearPerRegistryCreds(t, "registry-1.docker.io")
+	dir := makeDockerConfig(t, map[string]string{"registry-1.docker.io": "cfg-user:cfg-pass"})
+	t.Setenv("DOCKER_CONFIG", dir)
+
+	c, err := GetRegistrySpecificCredentials("registry-1.docker.io")
+	if err != nil || c == nil || c.Username != "cfg-user" {
+		t.Errorf("expected docker config creds; got %v err=%v", c, err)
+	}
+}

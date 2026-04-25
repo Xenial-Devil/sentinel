@@ -9,6 +9,7 @@ import (
 	"sentinel/logger"
 	"sentinel/metrics"
 	"sentinel/notifier"
+	"sentinel/registry"
 	"sentinel/scheduler"
 	"sentinel/updater"
 	"sentinel/webhook"
@@ -230,7 +231,18 @@ func (w *Watcher) runWithApproval(
 		return "skipped"
 	}
 
-	hasUpdate, remoteDigest, err := w.Updater.Registry.HasUpdate(localDigest, ct.Image)
+	var customCreds *registry.Credentials
+	userLabel := ct.Labels["sentinel.registry.user"]
+	passLabel := ct.Labels["sentinel.registry.pass"]
+
+	if userLabel != "" && passLabel != "" {
+		customCreds = &registry.Credentials{
+			Username: userLabel,
+			Password: passLabel,
+		}
+	}
+
+	hasUpdate, remoteDigest, err := w.Updater.Registry.HasUpdate(localDigest, ct.Image, customCreds)
 	if err != nil {
 		logger.Log.Warnf("Registry check failed for %s: %v", ct.Name, err)
 		return "skipped"

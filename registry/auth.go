@@ -29,7 +29,7 @@ type Credentials struct {
 
 // GetCredentials loads credentials for a registry.
 // Priority order:
-//  1. REPO_USER / REPO_PASS  — generic credentials from .env (applies to all registries)
+//  1. REPO_USER / REPO_PASS  — generic credentials from .env (applies to all private registries)
 //  2. SENTINEL_REGISTRY_USER_<HOST> / SENTINEL_REGISTRY_PASS_<HOST>  — per-registry override
 //     e.g. SENTINEL_REGISTRY_USER_GHCR_IO / SENTINEL_REGISTRY_PASS_GHCR_IO
 //  3. Docker config.json  — directory resolved from DOCKER_CONFIG env var, then OS default
@@ -47,6 +47,25 @@ func GetCredentials(reg string) (*Credentials, error) {
 	}
 
 	// 3. ~/.docker/config.json (or DOCKER_CONFIG dir)
+	return getDockerConfigCredentials(reg)
+}
+
+// GetRegistrySpecificCredentials loads credentials for a registry WITHOUT
+// falling back to the generic REPO_USER/REPO_PASS variables.
+// Use this for Docker Hub so that credentials meant for other private
+// registries (GHCR etc.) are never silently forwarded to Docker Hub.
+//
+// Priority order:
+//  1. SENTINEL_REGISTRY_USER_<HOST> / SENTINEL_REGISTRY_PASS_<HOST>
+//  2. Docker config.json entry for that registry
+func GetRegistrySpecificCredentials(reg string) (*Credentials, error) {
+	// 1. Per-registry env vars only
+	if creds := getPerRegistryEnvCredentials(reg); creds != nil {
+		logger.Log.Debugf("Using per-registry env-var credentials for: %s", reg)
+		return creds, nil
+	}
+
+	// 2. ~/.docker/config.json (or DOCKER_CONFIG dir)
 	return getDockerConfigCredentials(reg)
 }
 
@@ -144,6 +163,14 @@ func GetAuthHeader(reg string) string {
 	if err != nil || creds == nil {
 		return ""
 	}
+	return EncodeAuthHeader(creds)
+}
+
+// EncodeAuthHeader returns a base64-encoded JSON auth string from Credentials
+func EncodeAuthHeader(creds *Credentials) string {
+	if creds == nil {
+		return ""
+	}
 	jsonAuth := fmt.Sprintf(`{"username":%q,"password":%q}`, creds.Username, creds.Password)
 	return base64.URLEncoding.EncodeToString([]byte(jsonAuth))
 }
@@ -152,6 +179,14 @@ func GetAuthHeader(reg string) string {
 func GetBasicAuthHeader(reg string) string {
 	creds, err := GetCredentials(reg)
 	if err != nil || creds == nil {
+		return ""
+	}
+	return GetBasicAuthHeaderFromCreds(creds)
+}
+
+// GetBasicAuthHeaderFromCreds returns a standard HTTP Basic Authorization header value from Credentials.
+func GetBasicAuthHeaderFromCreds(creds *Credentials) string {
+	if creds == nil {
 		return ""
 	}
 	raw := creds.Username + ":" + creds.Password
