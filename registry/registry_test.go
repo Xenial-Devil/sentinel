@@ -87,7 +87,7 @@ func TestFetchDigest_ForwardsAuth(t *testing.T) {
 		w.Header().Set("Docker-Content-Digest", testDigest)
 	}))
 	defer srv.Close()
-	newClient(srv).fetchDigest(srv.URL, "Bearer tok")
+	_, _ = newClient(srv).fetchDigest(srv.URL, "Bearer tok")
 	if gotAuth != "Bearer tok" { t.Errorf("auth=%q", gotAuth) }
 }
 
@@ -155,7 +155,7 @@ func TestParseBearerChallenge_Empty(t *testing.T) {
 
 func TestGetDockerHubToken_Success(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]string{"token": "mytoken"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"token": "mytoken"})
 	}))
 	defer srv.Close()
 	old := dockerHubTokenURL
@@ -167,7 +167,7 @@ func TestGetDockerHubToken_Success(t *testing.T) {
 
 func TestGetDockerHubToken_EmptyToken(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]string{"token": ""})
+		_ = json.NewEncoder(w).Encode(map[string]string{"token": ""})
 	}))
 	defer srv.Close()
 	old := dockerHubTokenURL
@@ -179,7 +179,7 @@ func TestGetDockerHubToken_EmptyToken(t *testing.T) {
 
 func TestGetDockerHubToken_BadJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("not-json"))
+		_, _ = w.Write([]byte("not-json"))
 	}))
 	defer srv.Close()
 	old := dockerHubTokenURL
@@ -203,7 +203,7 @@ func TestGetDockerHubDigest_Success(t *testing.T) {
 	// One server handles both token + manifest requests
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "token") || r.URL.RawQuery != "" {
-			json.NewEncoder(w).Encode(map[string]string{"token": "tok"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"token": "tok"})
 			return
 		}
 		w.Header().Set("Docker-Content-Digest", testDigest)
@@ -235,7 +235,7 @@ func TestGetDockerHubDigest_TokenFail(t *testing.T) {
 func TestGetRemoteDigest_RoutesToDockerHub(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.RawQuery != "" {
-			json.NewEncoder(w).Encode(map[string]string{"token": "tok"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"token": "tok"})
 			return
 		}
 		w.Header().Set("Docker-Content-Digest", testDigest)
@@ -282,8 +282,8 @@ func TestPrivateDigest_AnonFail_NoCreds(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	os.Unsetenv("REPO_USER")
-	os.Unsetenv("REPO_PASS")
+	_ = os.Unsetenv("REPO_USER")
+	_ = os.Unsetenv("REPO_PASS")
 	t.Setenv("DOCKER_CONFIG", t.TempDir())
 
 	host := strings.TrimPrefix(srv.URL, "http://")
@@ -327,7 +327,7 @@ func TestPrivateDigest_BearerSuccess(t *testing.T) {
 			return
 		}
 		if r.URL.Path == "/token" {
-			json.NewEncoder(w).Encode(map[string]string{"token": "bearertok"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"token": "bearertok"})
 			return
 		}
 		// Manifest: reject anon and basic, accept bearer
@@ -357,7 +357,7 @@ func TestPrivateDigest_BearerFetchFails(t *testing.T) {
 			return
 		}
 		if r.URL.Path == "/token" {
-			json.NewEncoder(w).Encode(map[string]string{"token": "bearertok"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"token": "bearertok"})
 			return
 		}
 		// Always reject even bearer
@@ -424,7 +424,7 @@ func TestGetBearerToken_EmptyTokenResponse(t *testing.T) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]string{"token": "", "access_token": ""})
+		_ = json.NewEncoder(w).Encode(map[string]string{"token": "", "access_token": ""})
 	}))
 	defer srv.Close()
 	host := strings.TrimPrefix(srv.URL, "http://")
@@ -442,7 +442,7 @@ func TestGetBearerToken_AccessTokenFallback(t *testing.T) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]interface{}{"token": "", "access_token": "xyz"})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"token": "", "access_token": "xyz"})
 	}))
 	defer srv.Close()
 	host := strings.TrimPrefix(srv.URL, "http://")
@@ -466,7 +466,7 @@ func TestGetBearerToken_ProbeRequestFails(t *testing.T) {
 func TestHasUpdate_UpdateAvailable(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.RawQuery != "" {
-			json.NewEncoder(w).Encode(map[string]string{"token": "tok"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"token": "tok"})
 			return
 		}
 		w.Header().Set("Docker-Content-Digest", testDigest)
@@ -488,7 +488,7 @@ func TestHasUpdate_UpdateAvailable(t *testing.T) {
 func TestHasUpdate_UpToDate(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.RawQuery != "" {
-			json.NewEncoder(w).Encode(map[string]string{"token": "tok"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"token": "tok"})
 			return
 		}
 		w.Header().Set("Docker-Content-Digest", testDigest)

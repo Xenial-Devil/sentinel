@@ -33,17 +33,17 @@ func makeDockerConfig(t *testing.T, entries map[string]string) string {
 
 func clearGenericCreds(t *testing.T) {
 	t.Helper()
-	os.Unsetenv("REPO_USER")
-	os.Unsetenv("REPO_PASS")
+	_ = os.Unsetenv("REPO_USER")
+	_ = os.Unsetenv("REPO_PASS")
 }
 
 func clearPerRegistryCreds(t *testing.T, reg string) {
 	t.Helper()
 	normalized := strings.ToUpper(reg)
 	normalized = strings.NewReplacer(".", "_", ":", "_", "-", "_").Replace(normalized)
-	os.Unsetenv("SENTINEL_REGISTRY_USER_" + normalized)
-	os.Unsetenv("SENTINEL_REGISTRY_PASS_" + normalized)
-	os.Unsetenv("SENTINEL_REGISTRY_TOKEN_" + normalized)
+	_ = os.Unsetenv("SENTINEL_REGISTRY_USER_" + normalized)
+	_ = os.Unsetenv("SENTINEL_REGISTRY_PASS_" + normalized)
+	_ = os.Unsetenv("SENTINEL_REGISTRY_TOKEN_" + normalized)
 }
 
 // ── splitCredentials ──────────────────────────────────────────────────────────
@@ -95,14 +95,14 @@ func TestGenericEnv_BothSet(t *testing.T) {
 
 func TestGenericEnv_OnlyUser(t *testing.T) {
 	t.Setenv("REPO_USER", "u")
-	os.Unsetenv("REPO_PASS")
+	_ = os.Unsetenv("REPO_PASS")
 	if c := getGenericEnvCredentials(); c != nil {
 		t.Errorf("expected nil, got %v", c)
 	}
 }
 
 func TestGenericEnv_OnlyPass(t *testing.T) {
-	os.Unsetenv("REPO_USER")
+	_ = os.Unsetenv("REPO_USER")
 	t.Setenv("REPO_PASS", "p")
 	if c := getGenericEnvCredentials(); c != nil {
 		t.Errorf("expected nil, got %v", c)
@@ -110,8 +110,8 @@ func TestGenericEnv_OnlyPass(t *testing.T) {
 }
 
 func TestGenericEnv_NoneSet(t *testing.T) {
-	os.Unsetenv("REPO_USER")
-	os.Unsetenv("REPO_PASS")
+	_ = os.Unsetenv("REPO_USER")
+	_ = os.Unsetenv("REPO_PASS")
 	if c := getGenericEnvCredentials(); c != nil {
 		t.Errorf("expected nil, got %v", c)
 	}
@@ -147,8 +147,8 @@ func TestPerRegistry_TokenVariant(t *testing.T) {
 
 func TestPerRegistry_OnlyUserNoPass(t *testing.T) {
 	t.Setenv("SENTINEL_REGISTRY_USER_GHCR_IO", "u")
-	os.Unsetenv("SENTINEL_REGISTRY_PASS_GHCR_IO")
-	os.Unsetenv("SENTINEL_REGISTRY_TOKEN_GHCR_IO")
+	_ = os.Unsetenv("SENTINEL_REGISTRY_PASS_GHCR_IO")
+	_ = os.Unsetenv("SENTINEL_REGISTRY_TOKEN_GHCR_IO")
 	if c := getPerRegistryEnvCredentials("ghcr.io"); c != nil {
 		t.Errorf("expected nil, got %v", c)
 	}
@@ -192,7 +192,7 @@ func TestDockerConfigPath_EnvVarOverride(t *testing.T) {
 }
 
 func TestDockerConfigPath_EmptyEnvFallsToOS(t *testing.T) {
-	os.Unsetenv("DOCKER_CONFIG")
+	_ = os.Unsetenv("DOCKER_CONFIG")
 	got := getDockerConfigPath()
 	if !strings.HasSuffix(got, "config.json") {
 		t.Errorf("want ...config.json, got %q", got)
@@ -206,7 +206,7 @@ func TestDockerConfigPath_WindowsDefault(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("windows-only")
 	}
-	os.Unsetenv("DOCKER_CONFIG")
+	_ = os.Unsetenv("DOCKER_CONFIG")
 	got := getDockerConfigPath()
 	if !strings.Contains(got, os.Getenv("USERPROFILE")) {
 		t.Errorf("expected USERPROFILE in path, got %q", got)
@@ -217,7 +217,7 @@ func TestDockerConfigPath_UnixDefault(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unix-only")
 	}
-	os.Unsetenv("DOCKER_CONFIG")
+	_ = os.Unsetenv("DOCKER_CONFIG")
 	got := getDockerConfigPath()
 	if !strings.Contains(got, os.Getenv("HOME")) {
 		t.Errorf("expected HOME in path, got %q", got)
@@ -254,7 +254,7 @@ func TestDockerConfig_MissingFile(t *testing.T) {
 
 func TestDockerConfig_InvalidJSON(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "config.json"), []byte("not-json"), 0600)
+	_ = os.WriteFile(filepath.Join(dir, "config.json"), []byte("not-json"), 0600)
 	t.Setenv("DOCKER_CONFIG", dir)
 	_, err := getDockerConfigCredentials("ghcr.io")
 	if err == nil || !strings.Contains(err.Error(), "parse") {
@@ -266,7 +266,7 @@ func TestDockerConfig_InvalidBase64(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DockerConfig{Auths: map[string]AuthEntry{"ghcr.io": {Auth: "!!!notbase64"}}}
 	data, _ := json.Marshal(cfg)
-	os.WriteFile(filepath.Join(dir, "config.json"), data, 0600)
+	_ = os.WriteFile(filepath.Join(dir, "config.json"), data, 0600)
 	t.Setenv("DOCKER_CONFIG", dir)
 	_, err := getDockerConfigCredentials("ghcr.io")
 	if err == nil || !strings.Contains(err.Error(), "decode") {
@@ -280,7 +280,7 @@ func TestDockerConfig_NoColonInDecoded(t *testing.T) {
 	encoded := base64.StdEncoding.EncodeToString([]byte("nocolon"))
 	cfg := DockerConfig{Auths: map[string]AuthEntry{"ghcr.io": {Auth: encoded}}}
 	data, _ := json.Marshal(cfg)
-	os.WriteFile(filepath.Join(dir, "config.json"), data, 0600)
+	_ = os.WriteFile(filepath.Join(dir, "config.json"), data, 0600)
 	t.Setenv("DOCKER_CONFIG", dir)
 	_, err := getDockerConfigCredentials("ghcr.io")
 	if err == nil || !strings.Contains(err.Error(), "invalid") {
