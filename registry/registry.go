@@ -11,18 +11,24 @@ import (
 	"time"
 )
 
-// dockerHubTokenURL and dockerHubManifestBase are overridable in tests.
 var (
-	dockerHubTokenURL    = "https://auth.docker.io/token"
+	dockerHubTokenURL     = "https://auth.docker.io/token"
 	dockerHubManifestBase = "https://registry-1.docker.io/v2"
 )
 
 // ImageRef holds parsed image reference parts
 type ImageRef struct {
-	Registry string // e.g. registry-1.docker.io
-	Name     string // e.g. library/nginx
-	Tag      string // e.g. latest
-	Digest   string // e.g. sha256:abc...
+	Registry string
+	Name     string
+	Tag      string
+	Digest   string
+}
+
+// RemoteImageInfo holds full remote image information
+type RemoteImageInfo struct {
+	Digest    string // Docker-Content-Digest from manifest HEAD
+	Tag       string // Tag that was checked
+	MediaType string // Manifest media type
 }
 
 // Client handles registry communication
@@ -58,24 +64,20 @@ func ParseImageRef(image string) ImageRef {
 	}
 
 	// Split tag - must find last colon after last slash
-	// This handles registry:5000/repo vs repo:tag correctly
 	lastSlash := strings.LastIndex(image, "/")
 	lastColon := strings.LastIndex(image, ":")
 
 	if lastColon > lastSlash {
-		// colon is after last slash - it is a tag separator
 		ref.Tag = image[lastColon+1:]
 		image = image[:lastColon]
 	}
 
-	// Now image is name without tag
-	// Detect if first component is a registry (contains dot or colon or is localhost)
+	// Detect if first component is a registry
 	parts := strings.SplitN(image, "/", 2)
 	if len(parts) == 2 && isRegistry(parts[0]) {
 		ref.Registry = parts[0]
 		ref.Name = parts[1]
 	} else {
-		// Docker Hub
 		ref.Registry = "registry-1.docker.io"
 		if strings.Contains(image, "/") {
 			ref.Name = image
@@ -94,84 +96,97 @@ func isRegistry(s string) bool {
 		s == "localhost"
 }
 
-// GetRemoteDigest gets the digest of an image from its registry
-func (c *Client) GetRemoteDigest(image string, customCreds *Credentials) (string, error) {
+// GetRemoteDigest gets the digest of an image from its registry.
+func (c *Client) GetRemoteDigest(image string) (string, error) {
+	return c.GetRemoteDigestWithCreds(image, "", "")
+}
+
+// GetRemoteDigestWithCreds gets digest with optional label-level credential override.
+func (c *Client) GetRemoteDigestWithCreds(image, labelUser, labelPass string) (string, error) {
+	info, err := c.GetRemoteImageInfo(image, labelUser, labelPass)
+	if err != nil {
+		return "", err
+	}
+	return info.Digest, nil
+}
+
+// GetRemoteImageInfo gets full remote image info (digest + tag + media type).
+func (c *Client) GetRemoteImageInfo(image, labelUser, labelPass string) (*RemoteImageInfo, error) {
 	ref := ParseImageRef(image)
 
 	logger.Log.Debugf("Checking registry: registry=%s name=%s tag=%s",
 		ref.Registry, ref.Name, ref.Tag)
 
-	// Docker Hub needs token auth
 	if strings.Contains(ref.Registry, "docker.io") {
-		return c.getDockerHubDigest(ref, customCreds)
+		return c.getDockerHubInfo(ref, labelUser, labelPass)
 	}
 
-	// Private registry - attempt v2 without auth first
-	return c.getPrivateDigest(ref, customCreds)
+	return c.getPrivateInfo(ref, labelUser, labelPass)
 }
 
-// getDockerHubDigest gets digest from Docker Hub using token auth.
-//
-// Strategy:
-//  1. Try with an anonymous token — works for public images within the rate limit.
-//  2. On 401 (rate-limited or private image), look for Docker Hub-specific
-//     credentials (SENTINEL_REGISTRY_USER_REGISTRY_1_DOCKER_IO or a
-//     ~/.docker/config.json entry for docker.io).
-//     NOTE: the generic REPO_USER/REPO_PASS are intentionally skipped here
-//     because those credentials belong to other private registries (e.g. GHCR)
-//     and must not be forwarded to Docker Hub.
-func (c *Client) getDockerHubDigest(ref ImageRef, customCreds *Credentials) (string, error) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Docker Hub
+// ─────────────────────────────────────────────────────────────────────────────
+
+// getDockerHubInfo handles Docker Hub images.
+// Flow:
+//  1. Try anonymous token (works for public images like postgres, nginx)
+//  2. If that fails → try with credentials (for private Docker Hub repos)
+func (c *Client) getDockerHubInfo(ref ImageRef, labelUser, labelPass string) (*RemoteImageInfo, error) {
 	manifestURL := fmt.Sprintf("%s/%s/manifests/%s",
 		dockerHubManifestBase, ref.Name, ref.Tag)
 
-	if customCreds == nil {
-		// 1. Anonymous token attempt
-		anonToken, err := getDockerHubToken(ref.Name, c.HTTPClient, nil)
-		if err != nil {
-			return "", fmt.Errorf("failed to get docker hub token: %v", err)
-		}
-
-		digest, err := c.fetchDigest(manifestURL, anonToken)
-		if err == nil {
-			return digest, nil
-		}
-
-		// 2. Anonymous failed (rate-limited or private) — try Docker Hub-specific creds only
-		logger.Log.Debugf("Anonymous Docker Hub fetch failed for %s: %v — trying docker.io-specific credentials", ref.Name, err)
-	}
-
-	// Use GetRegistrySpecificCredentials so generic REPO_USER/REPO_PASS (meant for
-	// GHCR etc.) are never forwarded to Docker Hub.
-	var creds *Credentials
-	if customCreds != nil {
-		creds = customCreds
-	} else {
-		var _ error
-		creds, _ = GetRegistrySpecificCredentials(ref.Registry)
-		if creds == nil {
-			// Also check "docker.io" alias used in ~/.docker/config.json
-			creds, _ = GetRegistrySpecificCredentials("docker.io")
+	// ── Step 1: Try anonymous public token ───────────────────────────────────
+	token, err := getDockerHubToken(ref.Name, "", "", c.HTTPClient)
+	if err == nil {
+		info, fetchErr := c.fetchManifestInfo(manifestURL, "Bearer "+token)
+		if fetchErr == nil {
+			info.Tag = ref.Tag
+			logger.Log.Debugf("Docker Hub public access succeeded for %s digest=%s",
+				ref.Name, shortDigest(info.Digest))
+			return info, nil
 		}
 	}
-	if creds == nil {
-		return "", fmt.Errorf("registry returned 401 unauthorized and no docker.io credentials are configured")
+
+	logger.Log.Debugf("Docker Hub anonymous access failed for %s — trying authenticated", ref.Name)
+
+	// ── Step 2: Resolve credentials ──────────────────────────────────────────
+	user, pass := resolveCredentials(ref.Registry, labelUser, labelPass)
+	if user == "" {
+		return nil, fmt.Errorf(
+			"registry returned 401 unauthorized and no docker.io credentials are configured",
+		)
 	}
 
-	logger.Log.Debugf("Retrying Docker Hub fetch for %s with registry-specific credentials", ref.Name)
-	authedToken, err := getDockerHubToken(ref.Name, c.HTTPClient, creds)
+	// ── Step 3: Try authenticated token ──────────────────────────────────────
+	token, err = getDockerHubToken(ref.Name, user, pass, c.HTTPClient)
 	if err != nil {
-		return "", fmt.Errorf("failed to get authenticated docker hub token: %v", err)
+		return nil, fmt.Errorf("failed to get authenticated docker hub token: %v", err)
 	}
 
-	return c.fetchDigest(manifestURL, authedToken)
+	info, err := c.fetchManifestInfo(manifestURL, "Bearer "+token)
+	if err != nil {
+		return nil, fmt.Errorf("authenticated docker hub fetch failed: %v", err)
+	}
+
+	info.Tag = ref.Tag
+	logger.Log.Debugf("Docker Hub authenticated access succeeded for %s digest=%s",
+		ref.Name, shortDigest(info.Digest))
+	return info, nil
 }
 
-// getPrivateDigest gets digest from a private registry.
-// It first tries anonymous access; on 401 it attempts to authenticate
-// using credentials from env vars or ~/.docker/config.json.
-func (c *Client) getPrivateDigest(ref ImageRef, customCreds *Credentials) (string, error) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Private Registry (ghcr.io, ECR, custom, etc.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// getPrivateInfo handles private registries.
+// Flow:
+//  1. Try anonymous access
+//  2. If 401 → resolve credentials
+//  3. Try Basic auth
+//  4. Try Bearer token via WWW-Authenticate challenge
+func (c *Client) getPrivateInfo(ref ImageRef, labelUser, labelPass string) (*RemoteImageInfo, error) {
 	scheme := "https"
-	// Use http for localhost or plain IP with port
 	if ref.Registry == "localhost" || strings.HasPrefix(ref.Registry, "127.") {
 		scheme = "http"
 	}
@@ -181,62 +196,87 @@ func (c *Client) getPrivateDigest(ref ImageRef, customCreds *Credentials) (strin
 		scheme, ref.Registry, ref.Name, ref.Tag,
 	)
 
-	var digest string
-	var err error
-
-	if customCreds == nil {
-		// 1. Try anonymous first
-		digest, err = c.fetchDigest(manifestURL, "")
-		if err == nil {
-			return digest, nil
-		}
-
-		logger.Log.Debugf("Anonymous fetch failed for %s: %v — trying authenticated", ref.Registry, err)
-	}
-
-	// 2. Load credentials for this registry
-	var creds *Credentials
-	if customCreds != nil {
-		creds = customCreds
-	} else {
-		var credsErr error
-		creds, credsErr = GetCredentials(ref.Registry)
-		if credsErr != nil {
-			logger.Log.Debugf("Failed to load credentials for %s: %v", ref.Registry, credsErr)
-		}
-	}
-
-	if creds == nil {
-		return "", fmt.Errorf("private registry auth not configured for %s", ref.Registry)
-	}
-
-	// 3. Try Basic auth
-	basicHeader := GetBasicAuthHeaderFromCreds(creds)
-	digest, err = c.fetchDigest(manifestURL, basicHeader)
+	// ── Step 1: Try anonymous ────────────────────────────────────────────────
+	info, err := c.fetchManifestInfo(manifestURL, "")
 	if err == nil {
-		return digest, nil
+		info.Tag = ref.Tag
+		logger.Log.Debugf("Anonymous access succeeded for %s digest=%s",
+			ref.Registry, shortDigest(info.Digest))
+		return info, nil
 	}
 
-	// 4. Try Bearer token via WWW-Authenticate challenge (e.g. ghcr.io)
+	logger.Log.Debugf("Anonymous fetch failed for %s: %v — trying authenticated", ref.Registry, err)
+
+	// ── Step 2: Resolve credentials ──────────────────────────────────────────
+	user, pass := resolveCredentials(ref.Registry, labelUser, labelPass)
+	if user == "" {
+		return nil, fmt.Errorf("private registry auth not configured for %s", ref.Registry)
+	}
+
+	creds := &Credentials{Username: user, Password: pass}
+
+	// ── Step 3: Try Basic auth ───────────────────────────────────────────────
+	basicHeader := buildBasicAuthHeader(user, pass)
+	info, err = c.fetchManifestInfo(manifestURL, basicHeader)
+	if err == nil {
+		info.Tag = ref.Tag
+		logger.Log.Debugf("Basic auth succeeded for %s digest=%s",
+			ref.Registry, shortDigest(info.Digest))
+		return info, nil
+	}
+
+	// ── Step 4: Try Bearer token (ghcr.io, etc.) ─────────────────────────────
 	token, tokenErr := c.getBearerToken(ref, scheme, creds)
 	if tokenErr != nil {
 		logger.Log.Debugf("Bearer token fetch failed for %s: %v", ref.Registry, tokenErr)
-		return "", fmt.Errorf("authentication failed for %s: %v", ref.Registry, err)
+		return nil, fmt.Errorf("authentication failed for %s: %v", ref.Registry, err)
 	}
 
-	digest, err = c.fetchDigest(manifestURL, "Bearer "+token)
+	info, err = c.fetchManifestInfo(manifestURL, "Bearer "+token)
 	if err != nil {
-		return "", fmt.Errorf("authenticated fetch failed for %s: %v", ref.Registry, err)
+		return nil, fmt.Errorf("authenticated fetch failed for %s: %v", ref.Registry, err)
 	}
 
-	return digest, nil
+	info.Tag = ref.Tag
+	logger.Log.Debugf("Bearer auth succeeded for %s digest=%s",
+		ref.Registry, shortDigest(info.Digest))
+	return info, nil
 }
 
-// getBearerToken obtains a Bearer token from the registry's auth service.
-// It does a HEAD request without auth, reads the WWW-Authenticate header,
-// then fetches a token from the provided realm with the given credentials.
+// ─────────────────────────────────────────────────────────────────────────────
+// Credential Resolution
+// ─────────────────────────────────────────────────────────────────────────────
+
+// resolveCredentials returns (username, password) using priority order:
+//  1. Label-level credentials (per-container override)
+//  2. Per-registry env vars  (SENTINEL_REGISTRY_USER_GHCR_IO)
+//  3. Generic env vars       (REPO_USER / REPO_PASS)
+//  4. Docker config.json
+func resolveCredentials(reg, labelUser, labelPass string) (string, string) {
+	// 1. Label-level override (highest priority)
+	if labelUser != "" && labelPass != "" {
+		logger.Log.Debugf("Using label credentials for %s", reg)
+		return labelUser, labelPass
+	}
+
+	// 2 - 4. Fall through to GetCredentials
+	creds, err := GetCredentials(reg)
+	if err != nil {
+		logger.Log.Debugf("GetCredentials error for %s: %v", reg, err)
+		return "", ""
+	}
+	if creds == nil {
+		return "", ""
+	}
+
+	return creds.Username, creds.Password
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bearer Token
+// ─────────────────────────────────────────────────────────────────────────────
+
 func (c *Client) getBearerToken(ref ImageRef, scheme string, creds *Credentials) (string, error) {
-	// Probe the registry /v2/ endpoint to get the WWW-Authenticate header
 	probeURL := fmt.Sprintf("%s://%s/v2/", scheme, ref.Registry)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, probeURL, nil)
 	if err != nil {
@@ -257,14 +297,12 @@ func (c *Client) getBearerToken(ref ImageRef, scheme string, creds *Credentials)
 		return "", fmt.Errorf("expected 401 from /v2/, got %d", resp.StatusCode)
 	}
 
-	// Parse: Bearer realm="https://...",service="...",scope="..."
 	wwwAuth := resp.Header.Get("WWW-Authenticate")
 	realm, service, scope := parseBearerChallenge(wwwAuth, ref)
 	if realm == "" {
 		return "", fmt.Errorf("no Bearer realm in WWW-Authenticate: %s", wwwAuth)
 	}
 
-	// Build token request URL
 	tokenURL := fmt.Sprintf("%s?service=%s&scope=%s",
 		realm,
 		url.QueryEscape(service),
@@ -311,11 +349,8 @@ func (c *Client) getBearerToken(ref ImageRef, scheme string, creds *Credentials)
 }
 
 // parseBearerChallenge parses the WWW-Authenticate Bearer header.
-// Example: Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:user/repo:pull"
 func parseBearerChallenge(header string, ref ImageRef) (realm, service, scope string) {
 	header = strings.TrimPrefix(header, "Bearer ")
-
-	// Default scope for pulling
 	scope = fmt.Sprintf("repository:%s:pull", ref.Name)
 	service = ref.Registry
 
@@ -340,10 +375,13 @@ func parseBearerChallenge(header string, ref ImageRef) (realm, service, scope st
 	return realm, service, scope
 }
 
-// fetchDigest performs a HEAD request and extracts the Docker-Content-Digest header.
-// authHeader can be a full Authorization header value (e.g. "Bearer <token>" or "Basic <b64>")
-// or an empty string for anonymous access.
-func (c *Client) fetchDigest(manifestURL string, authHeader string) (string, error) {
+// ─────────────────────────────────────────────────────────────────────────────
+// HTTP helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// fetchManifestInfo performs a HEAD request and returns full manifest info.
+// Returns digest from Docker-Content-Digest header and media type.
+func (c *Client) fetchManifestInfo(manifestURL string, authHeader string) (*RemoteImageInfo, error) {
 	req, err := http.NewRequestWithContext(
 		context.Background(),
 		http.MethodHead,
@@ -351,21 +389,24 @@ func (c *Client) fetchDigest(manifestURL string, authHeader string) (string, err
 		nil,
 	)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	if authHeader != "" {
 		req.Header.Set("Authorization", authHeader)
 	}
+
+	// Accept all manifest types to get correct digest
 	req.Header.Set("Accept", strings.Join([]string{
 		"application/vnd.docker.distribution.manifest.v2+json",
 		"application/vnd.docker.distribution.manifest.list.v2+json",
 		"application/vnd.oci.image.manifest.v1+json",
+		"application/vnd.oci.image.index.v1+json",
 	}, ", "))
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("registry request failed: %v", err)
+		return nil, fmt.Errorf("registry request failed: %v", err)
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
@@ -374,46 +415,31 @@ func (c *Client) fetchDigest(manifestURL string, authHeader string) (string, err
 	}()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		return "", fmt.Errorf("registry returned 401 unauthorized")
+		return nil, fmt.Errorf("registry returned 401 unauthorized")
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("registry returned status: %d", resp.StatusCode)
+		return nil, fmt.Errorf("registry returned status: %d", resp.StatusCode)
 	}
 
 	digest := resp.Header.Get("Docker-Content-Digest")
 	if digest == "" {
-		return "", fmt.Errorf("no digest in registry response")
+		return nil, fmt.Errorf("no digest in registry response")
 	}
 
-	return digest, nil
+	return &RemoteImageInfo{
+		Digest:    digest,
+		MediaType: resp.Header.Get("Content-Type"),
+	}, nil
 }
 
-// HasUpdate checks if a newer image is available
-func (c *Client) HasUpdate(localDigest string, image string, customCreds *Credentials) (bool, string, error) {
-	remoteDigest, err := c.GetRemoteDigest(image, customCreds)
-	if err != nil {
-		return false, "", err
-	}
+// ─────────────────────────────────────────────────────────────────────────────
+// Docker Hub token
+// ─────────────────────────────────────────────────────────────────────────────
 
-	if remoteDigest != localDigest {
-		logger.Log.WithFields(logger.Fields{
-			"image":         image,
-			"local_digest":  localDigest[:min(12, len(localDigest))],
-			"remote_digest": remoteDigest[:min(12, len(remoteDigest))],
-		}).Info("🆕  Update available")
-		return true, remoteDigest, nil
-	}
-
-	logger.Log.Debugf("No update for %s", image)
-	return false, remoteDigest, nil
-}
-
-// getDockerHubToken gets a Bearer token from Docker Hub.
-// If creds are provided, they are sent as Basic auth to the token endpoint so
-// that Docker Hub applies the authenticated rate limit (unlimited) instead of
-// the anonymous one (100 pulls / 6 h / IP).
-func getDockerHubToken(imageName string, client *http.Client, creds *Credentials) (string, error) {
+// getDockerHubToken fetches a Docker Hub token.
+// Pass empty user/pass for anonymous (public) access.
+func getDockerHubToken(imageName, user, pass string, client *http.Client) (string, error) {
 	tokenURL := fmt.Sprintf(
 		"%s?service=registry.docker.io&scope=repository:%s:pull",
 		dockerHubTokenURL, imageName,
@@ -423,9 +449,9 @@ func getDockerHubToken(imageName string, client *http.Client, creds *Credentials
 	if err != nil {
 		return "", err
 	}
-	if creds != nil {
-		logger.Log.Debugf("Using authenticated Docker Hub token request for %s", imageName)
-		req.SetBasicAuth(creds.Username, creds.Password)
+
+	if user != "" && pass != "" {
+		req.SetBasicAuth(user, pass)
 	}
 
 	resp, err := client.Do(req)
@@ -437,10 +463,6 @@ func getDockerHubToken(imageName string, client *http.Client, creds *Credentials
 			logger.Log.Warnf("Failed to close auth response body: %v", err)
 		}
 	}()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("docker hub token endpoint returned %d", resp.StatusCode)
-	}
 
 	var result struct {
 		Token string `json:"token"`
@@ -457,10 +479,99 @@ func getDockerHubToken(imageName string, client *http.Client, creds *Credentials
 	return result.Token, nil
 }
 
-// min returns the smaller of two ints
-func min(a, b int) int {
-	if a < b {
-		return a
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API
+// ─────────────────────────────────────────────────────────────────────────────
+
+// HasUpdate checks if a newer image is available by comparing SHA digests.
+func (c *Client) HasUpdate(localDigest string, image string) (bool, string, error) {
+	return c.HasUpdateWithCreds(localDigest, image, "", "")
+}
+
+// HasUpdateWithCreds checks for update with optional label-level credential override.
+// Compares local digest vs remote digest (SHA-based — most reliable).
+func (c *Client) HasUpdateWithCreds(localDigest, image, labelUser, labelPass string) (bool, string, error) {
+	info, err := c.GetRemoteImageInfo(image, labelUser, labelPass)
+	if err != nil {
+		return false, "", err
 	}
-	return b
+
+	remoteDigest := info.Digest
+
+	logger.Log.Debugf("Digest comparison for %s: local=%s remote=%s",
+		image,
+		shortDigest(localDigest),
+		shortDigest(remoteDigest),
+	)
+
+	// ── Compare digests (SHA-based) ───────────────────────────────────────────
+	// Normalize both digests before comparing
+	// Local digest may be stored as "sha256:abc..." directly
+	// Remote digest comes as "sha256:abc..." from Docker-Content-Digest header
+	if digestsMatch(localDigest, remoteDigest) {
+		logger.Log.Debugf("✔   Digests match — no update for %s", image)
+		return false, remoteDigest, nil
+	}
+
+	logger.Log.WithFields(logger.Fields{
+		"image":         image,
+		"tag":           info.Tag,
+		"local_digest":  shortDigest(localDigest),
+		"remote_digest": shortDigest(remoteDigest),
+		"media_type":    info.MediaType,
+	}).Info("🆕  Update available (digest mismatch)")
+
+	return true, remoteDigest, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Digest helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// digestsMatch compares two digest strings.
+// Handles cases where one might be prefixed with "sha256:" and the other not.
+// Also handles manifest list vs single-platform digest differences.
+func digestsMatch(local, remote string) bool {
+	if local == "" || remote == "" {
+		return false
+	}
+
+	// Direct match
+	if local == remote {
+		return true
+	}
+
+	// Normalize: strip algorithm prefix for comparison
+	localHash := stripAlgorithmPrefix(local)
+	remoteHash := stripAlgorithmPrefix(remote)
+
+	if localHash == remoteHash {
+		return true
+	}
+
+	// Check if local digest is contained within remote or vice versa
+	// This handles cases where local stores a platform-specific digest
+	// but remote returns a manifest list digest
+	if strings.HasPrefix(localHash, remoteHash) || strings.HasPrefix(remoteHash, localHash) {
+		return true
+	}
+
+	return false
+}
+
+// stripAlgorithmPrefix removes the "sha256:" or "sha512:" prefix from a digest
+func stripAlgorithmPrefix(digest string) string {
+	if idx := strings.Index(digest, ":"); idx != -1 {
+		return digest[idx+1:]
+	}
+	return digest
+}
+
+// shortDigest returns first 12 chars of a digest for logging
+func shortDigest(digest string) string {
+	hash := stripAlgorithmPrefix(digest)
+	if len(hash) > 12 {
+		return hash[:12]
+	}
+	return hash
 }

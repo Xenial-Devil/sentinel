@@ -17,6 +17,12 @@ import (
 	"github.com/docker/docker/api/types/network"
 )
 
+// Label keys for per-container registry credential override
+const (
+	LabelRegistryUser = "com.sentinel.registry.user"
+	LabelRegistryPass = "com.sentinel.registry.pass"
+)
+
 // UpdateResult holds the result of an update
 type UpdateResult struct {
 	ContainerName string
@@ -61,6 +67,15 @@ func (u *Updater) CheckAndUpdate(
 		NoRestart:     noRestart,
 	}
 
+	// ── Extract per-container label credentials ───────────────────────────────
+	labelUser := ct.Labels[LabelRegistryUser]
+	labelPass := ct.Labels[LabelRegistryPass]
+
+	if labelUser != "" && labelPass != "" {
+		logger.Log.Debugf("Container %s has label credentials — using override for %s",
+			ct.Name, ct.Image)
+	}
+
 	logger.LogImageCheckStart(ct.Name, ct.Image)
 
 	// ── No-pull mode ──────────────────────────────────────────────────────────
@@ -73,7 +88,7 @@ func (u *Updater) CheckAndUpdate(
 		}
 
 		if rollingRestart || u.Config.RollingRestart {
-			return u.applyRollingRestart(ct, result)
+			return u.applyRollingRestart(ct, result, labelUser, labelPass)
 		}
 
 		return u.applyRestartOnly(ct, result)
@@ -87,19 +102,8 @@ func (u *Updater) CheckAndUpdate(
 		return result
 	}
 
-	// ── Check registry ────────────────────────────────────────────────────────
-	var customCreds *registry.Credentials
-	userLabel := ct.Labels["sentinel.registry.user"]
-	passLabel := ct.Labels["sentinel.registry.pass"]
-
-	if userLabel != "" && passLabel != "" {
-		customCreds = &registry.Credentials{
-			Username: userLabel,
-			Password: passLabel,
-		}
-	}
-
-	hasUpdate, _, err := u.Registry.HasUpdate(localDigest, ct.Image, customCreds)
+	// ── Check registry (with label creds if present) ──────────────────────────
+	hasUpdate, _, err := u.Registry.HasUpdateWithCreds(localDigest, ct.Image, labelUser, labelPass)
 	if err != nil {
 		logger.Log.Warnf("Failed to check registry for %s: %v", ct.Name, err)
 		result.Error = err
@@ -133,7 +137,7 @@ func (u *Updater) CheckAndUpdate(
 	// ── No-restart: pull only ─────────────────────────────────────────────────
 	if noRestart || u.Config.NoRestart {
 		logger.Log.Infof("📥  [NO-RESTART] %s pulling image but not restarting", ct.Name)
-		if err := u.pullImage(ct); err != nil {
+		if err := u.pullImage(ct.Image, labelUser, labelPass); err != nil {
 			logger.LogImagePullFailed(ct.Name, ct.Image, err)
 			result.Error = err
 			return result
@@ -146,12 +150,12 @@ func (u *Updater) CheckAndUpdate(
 
 	// ── Rolling restart ───────────────────────────────────────────────────────
 	if rollingRestart || u.Config.RollingRestart {
-		return u.applyRollingRestart(ct, result)
+		return u.applyRollingRestart(ct, result, labelUser, labelPass)
 	}
 
 	// ── Standard update ───────────────────────────────────────────────────────
 	start := time.Now()
-	if err := u.applyUpdate(ct, &result); err != nil {
+	if err := u.applyUpdate(ct, &result, labelUser, labelPass); err != nil {
 		logger.Log.Errorf("Failed to update %s: %v", ct.Name, err)
 		result.Error = err
 		return result
@@ -165,7 +169,11 @@ func (u *Updater) CheckAndUpdate(
 }
 
 // applyUpdate pulls new image, stops old container, recreates with health check
-func (u *Updater) applyUpdate(ct docker.ContainerInfo, result *UpdateResult) error {
+func (u *Updater) applyUpdate(
+	ct docker.ContainerInfo,
+	result *UpdateResult,
+	labelUser, labelPass string,
+) error {
 	info, err := u.Client.InspectContainer(ct.ID)
 	if err != nil {
 		return fmt.Errorf("failed to inspect container: %v", err)
@@ -176,7 +184,7 @@ func (u *Updater) applyUpdate(ct docker.ContainerInfo, result *UpdateResult) err
 	// Pull
 	logger.LogImagePullStart(ct.Name, ct.Image)
 	pullStart := time.Now()
-	if err := u.pullImage(ct); err != nil {
+	if err := u.pullImage(ct.Image, labelUser, labelPass); err != nil {
 		logger.LogImagePullFailed(ct.Name, ct.Image, err)
 		return fmt.Errorf("failed to pull image: %v", err)
 	}
@@ -238,7 +246,11 @@ func (u *Updater) applyUpdate(ct docker.ContainerInfo, result *UpdateResult) err
 }
 
 // applyRollingRestart stops and restarts container with optional image pull
-func (u *Updater) applyRollingRestart(ct docker.ContainerInfo, result UpdateResult) UpdateResult {
+func (u *Updater) applyRollingRestart(
+	ct docker.ContainerInfo,
+	result UpdateResult,
+	labelUser, labelPass string,
+) UpdateResult {
 	logger.Log.Infof("🔄  [ROLLING-RESTART] Starting rolling restart for %s", ct.Name)
 
 	info, err := u.Client.InspectContainer(ct.ID)
@@ -252,7 +264,7 @@ func (u *Updater) applyRollingRestart(ct docker.ContainerInfo, result UpdateResu
 	if !result.NoPull {
 		logger.LogImagePullStart(ct.Name, ct.Image)
 		pullStart := time.Now()
-		if err := u.pullImage(ct); err != nil {
+		if err := u.pullImage(ct.Image, labelUser, labelPass); err != nil {
 			logger.LogImagePullFailed(ct.Name, ct.Image, err)
 			result.Error = err
 			return result
@@ -327,55 +339,16 @@ func (u *Updater) applyRestartOnly(ct docker.ContainerInfo, result UpdateResult)
 	return result
 }
 
-// pullImage pulls a new image from registry, using credentials for private registries.
-func (u *Updater) pullImage(ct docker.ContainerInfo) error {
+// pullImage pulls a new image from registry.
+// Uses label credentials if provided, otherwise falls back to global credentials.
+func (u *Updater) pullImage(image, labelUser, labelPass string) error {
 	ctx := context.Background()
 
-	var customCreds *registry.Credentials
-	userLabel := ct.Labels["sentinel.registry.user"]
-	passLabel := ct.Labels["sentinel.registry.pass"]
-
-	if userLabel != "" && passLabel != "" {
-		customCreds = &registry.Credentials{
-			Username: userLabel,
-			Password: passLabel,
-		}
-	}
-
-	image := ct.Image
 	ref := registry.ParseImageRef(image)
 
-	if customCreds != nil {
-		logger.Log.Infof("Using custom credentials from labels for %s", ct.Name)
-		authHeader := registry.EncodeAuthHeader(customCreds)
-		return u.doPull(ctx, image, authHeader)
-	}
+	// Resolve auth header: label creds > global creds
+	authHeader := registry.GetAuthHeaderWithCreds(ref.Registry, labelUser, labelPass)
 
-	logger.Log.Infof("Attempting public pull for %s", ct.Name)
-	err := u.doPull(ctx, image, "")
-	if err == nil {
-		logger.Log.Infof("Public pull successful for %s", ct.Name)
-		return nil
-	}
-
-	logger.Log.Infof("Public pull failed for %s, trying with global credentials: %v", ct.Name, err)
-
-	authHeader := registry.GetAuthHeader(ref.Registry)
-	if authHeader == "" {
-		return fmt.Errorf("public pull failed and no global credentials found: %v", err)
-	}
-
-	err = u.doPull(ctx, image, authHeader)
-	if err == nil {
-		logger.Log.Infof("Credential pull successful for %s", ct.Name)
-		return nil
-	}
-
-	logger.Log.Errorf("Credential pull failed for %s: %v", ct.Name, err)
-	return err
-}
-
-func (u *Updater) doPull(ctx context.Context, image, authHeader string) error {
 	reader, err := u.Client.CLI.ImagePull(
 		ctx,
 		image,
@@ -442,7 +415,7 @@ func (u *Updater) recreateContainer(name string, info dockertypes.ContainerJSON)
 	return nil
 }
 
-// GetLocalDigest gets the digest of a local image - exported for watcher approval flow
+// GetLocalDigest gets the digest of a local image
 func (u *Updater) GetLocalDigest(imageID string) (string, error) {
 	ctx := context.Background()
 

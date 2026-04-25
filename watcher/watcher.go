@@ -9,7 +9,6 @@ import (
 	"sentinel/logger"
 	"sentinel/metrics"
 	"sentinel/notifier"
-	"sentinel/registry"
 	"sentinel/scheduler"
 	"sentinel/updater"
 	"sentinel/webhook"
@@ -219,6 +218,30 @@ func (w *Watcher) runUpdate(ct docker.ContainerInfo) string {
 	return w.executeUpdate(ct, noPull, noRestart, rollingRestart)
 }
 
+// getLabelCredentials extracts registry credentials from container labels.
+// Supports both label formats:
+//   - com.sentinel.registry.user / com.sentinel.registry.pass  (new standard)
+//   - sentinel.registry.user / sentinel.registry.pass          (legacy short form)
+//
+// Returns ("", "") if no label credentials are set.
+func getLabelCredentials(labels map[string]string) (string, string) {
+	// New standard format (highest priority)
+	user := labels["com.sentinel.registry.user"]
+	pass := labels["com.sentinel.registry.pass"]
+	if user != "" && pass != "" {
+		return user, pass
+	}
+
+	// Legacy short format fallback
+	user = labels["sentinel.registry.user"]
+	pass = labels["sentinel.registry.pass"]
+	if user != "" && pass != "" {
+		return user, pass
+	}
+
+	return "", ""
+}
+
 // runWithApproval gates update on approval after detecting real update
 func (w *Watcher) runWithApproval(
 	ct docker.ContainerInfo,
@@ -231,18 +254,20 @@ func (w *Watcher) runWithApproval(
 		return "skipped"
 	}
 
-	var customCreds *registry.Credentials
-	userLabel := ct.Labels["sentinel.registry.user"]
-	passLabel := ct.Labels["sentinel.registry.pass"]
+	// Extract label-level credentials
+	labelUser, labelPass := getLabelCredentials(ct.Labels)
 
-	if userLabel != "" && passLabel != "" {
-		customCreds = &registry.Credentials{
-			Username: userLabel,
-			Password: passLabel,
-		}
+	if labelUser != "" {
+		logger.Log.Debugf("Using label credentials for approval check: %s", ct.Name)
 	}
 
-	hasUpdate, remoteDigest, err := w.Updater.Registry.HasUpdate(localDigest, ct.Image, customCreds)
+	// Use HasUpdateWithCreds — passes label creds if present, else falls back to globals
+	hasUpdate, remoteDigest, err := w.Updater.Registry.HasUpdateWithCreds(
+		localDigest,
+		ct.Image,
+		labelUser,
+		labelPass,
+	)
 	if err != nil {
 		logger.Log.Warnf("Registry check failed for %s: %v", ct.Name, err)
 		return "skipped"
